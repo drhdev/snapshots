@@ -1,0 +1,44 @@
+{
+  "hetzner_cloud_server": {
+    "provider": "hetzner",
+    "id": "your-hetzner-cloud-server-id-2",
+    "name": "your-hetzner-cloud-server-name-2",
+    "api_token": "your_hetzner_api_token_2",
+    "retain_last_snapshots": 3,
+    "telegram": {
+      "enabled": true,
+      "bot_token": "your_telegram_bot_token_here",
+      "chat_id": "your_telegram_chat_id_here",
+      "message_success": "*Snapshot Success*\nServer: `{server_name}`\nSnapshot: `{snapshot_name}`\nTotal: `{total_snapshots}` snapshots",
+      "message_failure": "*Snapshot Failed*\nServer: `{server_name}`\nError occurred during snapshot creation"
+    },
+    "webhook": {
+      "enabled": true,
+      "url": "https://your-webhook-url.com/notify",
+      "payload_success": {
+        "script": "{script}",
+        "provider": "hetzner",
+        "server": "{server_name}",
+        "server_id": "{server_id}",
+        "status": "{status}",
+        "hostname": "{hostname}",
+        "timestamp": "{timestamp}",
+        "snapshot_name": "{snapshot_name}",
+        "total_snapshots": "{total_snapshots}",
+        "snapshot_info": "{snapshot_info}"
+      },
+      "payload_failure": {
+        "script": "{script}",
+        "provider": "hetzner",
+        "server": "{server_name}",
+        "server_id": "{server_id}",
+        "status": "{status}",
+        "hostname": "{hostname}",
+        "timestamp": "{timestamp}",
+        "snapshot_name": "{snapshot_name}",
+        "total_snapshots": "{total_snapshots}",
+        "snapshot_info": "{snapshot_info}"
+      }
+    }
+  }
+}

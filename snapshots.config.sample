@@ -1,0 +1,113 @@
+[DEFAULT]
+# snapshots.py Configuration File
+# This file contains all configurable settings for the snapshot management script.
+# You can adjust these values without modifying the script itself.
+
+# ============================================================================
+# Directory Configuration
+# ============================================================================
+[DIRECTORIES]
+# Directory containing server configuration JSON files (relative to project directory)
+configs_dir = configs
+
+# Directory for storing log files and lock files (relative to project directory, defaults to logs/)
+logs_dir = logs
+
+# ============================================================================
+# File Configuration
+# ============================================================================
+[FILES]
+# Log file name (relative to logs_dir, which is relative to project directory)
+log_file = snapshots.log
+
+# Lock file name (relative to logs_dir, which is relative to project directory) - prevents concurrent execution
+lock_file = snapshots.lock
+
+# ============================================================================
+# Timing Configuration
+# ============================================================================
+[TIMING]
+# Delay in seconds between processing different servers
+delay_between_servers = 20
+
+# ============================================================================
+# Logging Configuration
+# ============================================================================
+[LOGGING]
+# Log rotation: maximum file size in bytes (5MB default)
+max_bytes = 5242880
+
+# Log rotation: number of backup files to keep
+backup_count = 5
+
+# Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL
+level = DEBUG
+
+# ============================================================================
+# Telegram Configuration (Global Fallback)
+# ============================================================================
+# These settings are used as GLOBAL FALLBACK when per-server Telegram settings
+# are not defined in the individual JSON configuration files.
+# Per-server Telegram settings in JSON files take precedence over these global settings.
+# If both global and per-server settings are empty, Telegram notifications are skipped.
+[TELEGRAM]
+# Enable Telegram notifications globally (set to false to disable)
+# Note: Per-server Telegram settings in JSON files take precedence
+enabled = true
+
+# Telegram Bot Token (GLOBAL FALLBACK)
+# Used only if not set in individual server JSON configuration files
+# Leave empty if you want to set Telegram credentials per-server in JSON files
+bot_token = 
+
+# Telegram Chat ID (GLOBAL FALLBACK)
+# Used only if not set in individual server JSON configuration files
+# Leave empty if you want to set Telegram credentials per-server in JSON files
+chat_id = 
+
+# API timeout in seconds
+timeout = 10
+
+# Number of retries when sending messages fails
+retries = 3
+
+# Base delay in seconds for exponential backoff retry attempts
+# The actual delay will be: base_delay * (2 ^ (attempt_number - 1))
+# Example: With base_delay=2, retries will wait 2s, 4s, 8s, 16s, etc.
+base_delay_between_retries = 2
+
+# Telegram message templates (GLOBAL FALLBACK)
+# Used when per-server message templates are not defined in JSON files
+# Supports template variables: {script}, {provider}, {server_name}, {server_id}, 
+# {snapshot_name}, {total_snapshots}, {snapshot_info}, {status}, {hostname}, {timestamp}
+# Leave empty to use default formatted message
+message_success = *Snapshot Success*\nServer: `{server_name}`\nSnapshot: `{snapshot_name}`\nTotal: `{total_snapshots}` snapshots
+message_failure = *Snapshot Failed*\nServer: `{server_name}`\nError occurred during snapshot creation
+
+# ============================================================================
+# Webhook Configuration (Global Fallback)
+# ============================================================================
+# These settings are used as GLOBAL FALLBACK when per-server webhook settings
+# are not defined in the individual JSON configuration files.
+# Per-server webhook settings in JSON files take precedence over these global settings.
+# If both global and per-server settings are empty, webhook notifications are skipped.
+[WEBHOOK]
+# Enable webhook notifications globally (set to false to disable)
+# Note: Per-server webhook settings in JSON files take precedence
+enabled = false
+
+# Webhook URL (GLOBAL FALLBACK)
+# Used only if not set in individual server JSON configuration files
+# Leave empty if you want to set webhook URL per-server in JSON files
+url = 
+
+# Timeout in seconds for webhook requests
+timeout = 10
+
+# Number of retries when webhook calls fail
+retries = 3
+
+# Base delay in seconds for exponential backoff retry attempts
+# The actual delay will be: base_delay * (2 ^ (attempt_number - 1))
+# Example: With base_delay=2, retries will wait 2s, 4s, 8s, 16s, etc.
+base_delay_between_retries = 2
