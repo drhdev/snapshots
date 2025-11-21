@@ -532,13 +532,14 @@ For reliable cronjob execution, follow these steps:
    The following cronjob runs daily at 6:00 AM and uses bulletproof execution with absolute paths:
 
    ```cron
-   0 6 * * * PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin && cd /absolute/path/to/snapshots && /absolute/path/to/python3 snapshots.py > logs/cronjob.log 2>&1
+   0 6 * * * PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin && cd /absolute/path/to/snapshots && mkdir -p logs && /absolute/path/to/python3 snapshots.py > logs/cronjob.log 2>&1
    ```
 
    **Important Configuration:**
    - **Time**: `0 6 * * *` = 6:00 AM every day
    - **PATH**: Set explicitly to ensure all commands are found
    - **Working Directory**: `cd` to the script directory before execution
+   - **Logs Directory**: `mkdir -p logs &&` ensures the logs directory exists before redirecting (prevents silent failures)
    - **Python Path**: Use absolute path to Python executable
    - **Log File**: `> logs/cronjob.log` overwrites the log file each execution (use `>>` to append instead)
    - **Error Redirection**: `2>&1` redirects stderr to stdout, capturing all output
@@ -548,7 +549,7 @@ For reliable cronjob execution, follow these steps:
    If using a virtual environment, use the venv's Python:
 
    ```cron
-   0 6 * * * PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin && cd /home/user/snapshots && /home/user/snapshots/venv/bin/python3 snapshots.py > logs/cronjob.log 2>&1
+   0 6 * * * PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin && cd /home/user/snapshots && mkdir -p logs && /home/user/snapshots/venv/bin/python3 snapshots.py > logs/cronjob.log 2>&1
    ```
 
 6. **Example with System Python**
@@ -556,7 +557,7 @@ For reliable cronjob execution, follow these steps:
    If using system Python:
 
    ```cron
-   0 6 * * * PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin && cd /opt/snapshots && /usr/bin/python3 snapshots.py > logs/cronjob.log 2>&1
+   0 6 * * * PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin && cd /opt/snapshots && mkdir -p logs && /usr/bin/python3 snapshots.py > logs/cronjob.log 2>&1
    ```
 
 7. **Verify the Cronjob**
@@ -580,7 +581,7 @@ For reliable cronjob execution, follow these steps:
 
    ```bash
    # Test the exact command that cron will run:
-   PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin && cd /absolute/path/to/snapshots && /absolute/path/to/python3 snapshots.py > logs/cronjob.log 2>&1
+   PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin && cd /absolute/path/to/snapshots && mkdir -p logs && /absolute/path/to/python3 snapshots.py > logs/cronjob.log 2>&1
    
    # Check the log file:
    cat logs/cronjob.log
@@ -590,10 +591,25 @@ For reliable cronjob execution, follow these steps:
 
 - **Location**: `logs/cronjob.log` (in the `logs/` subdirectory)
 - **Behavior**: Overwritten with each execution (using `>` redirect)
-- **Content**: All stdout and stderr output from the script execution
+- **Content**: All stdout and stderr output from the script execution, including:
+  - Startup timestamp and script initialization messages
+  - Lock acquisition confirmation with process ID
+  - Number of configuration files found
+  - Execution summary (success/failure counts)
+  - Completion status or error messages
+  - Any critical errors that occur during execution
 - **Rotation**: The log file is overwritten each time the cronjob runs, keeping only the latest execution output
 
-**Note**: If you prefer to append logs instead of overwriting, change `>` to `>>` in the cronjob entry. However, overwriting (`>`) is recommended for cronjobs to prevent log file growth and make it easier to see the latest execution results.
+**Example cronjob.log content:**
+```
+[2025-01-18 06:00:00] Starting snapshot management script...
+[2025-01-18 06:00:00] Lock acquired successfully (PID: 12345)
+[2025-01-18 06:00:00] Found 3 configuration file(s).
+[2025-01-18 06:05:30] SUMMARY: 3 succeeded, 0 failed out of 3 total
+[2025-01-18 06:05:30] Script completed successfully.
+```
+
+**Note**: If you prefer to append logs instead of overwriting, change `>` to `>>` in the cronjob entry. However, overwriting (`>`) is recommended for cronjobs to prevent log file growth and make it easier to see the latest execution results. The script automatically creates the `logs/` directory if it doesn't exist, but including `mkdir -p logs &&` in the cron command ensures the directory exists before redirecting output, preventing silent failures.
 
 ### Troubleshooting Cronjobs
 
@@ -619,6 +635,18 @@ If the cronjob doesn't run as expected:
    ```bash
    cat logs/cronjob.log
    ```
+   
+   The cronjob log should contain timestamped messages showing:
+   - Script startup confirmation
+   - Lock acquisition status
+   - Number of configuration files found
+   - Execution summary
+   - Completion status
+   
+   If the log file is empty or missing, verify:
+   - The `logs/` directory exists (or use `mkdir -p logs &&` in cron command)
+   - The cron command includes proper output redirection (`> logs/cronjob.log 2>&1`)
+   - The script has permission to write to the logs directory
 
 4. **Verify Permissions**: Ensure the script and directories are executable
    ```bash

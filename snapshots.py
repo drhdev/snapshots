@@ -45,7 +45,8 @@ def load_config() -> configparser.ConfigParser:
             'lock_file': 'snapshots.lock'
         },
         'TIMING': {
-            'delay_between_servers': '5'
+            'delay_between_servers': '5',
+            'snapshot_creation_timeout': '900'  # 15 minutes in seconds
         },
         'LOGGING': {
             'max_bytes': '5242880',
@@ -98,6 +99,7 @@ DEFAULT_CONFIG_FILE = os.path.join(CONFIGS_DIR, "config.json")
 LOG_FILE = os.path.join(LOGS_DIR, _CONFIG.get('FILES', 'log_file', fallback='snapshots.log'))
 LOCK_FILE = os.path.join(LOGS_DIR, _CONFIG.get('FILES', 'lock_file', fallback='snapshots.lock'))
 DELAY_BETWEEN_SERVERS = _CONFIG.getint('TIMING', 'delay_between_servers', fallback=20)
+SNAPSHOT_CREATION_TIMEOUT = _CONFIG.getint('TIMING', 'snapshot_creation_timeout', fallback=900)  # 15 minutes default
 LOG_MAX_BYTES = _CONFIG.getint('LOGGING', 'max_bytes', fallback=5242880)
 LOG_BACKUP_COUNT = _CONFIG.getint('LOGGING', 'backup_count', fallback=5)
 LOG_LEVEL = getattr(logging, _CONFIG.get('LOGGING', 'level', fallback='DEBUG').upper(), logging.DEBUG)
@@ -567,7 +569,8 @@ class SnapshotManager:
                 
                 # Extract optional Telegram settings
                 telegram_config = server_data.get('telegram', {})
-                telegram_enabled = telegram_config.get('enabled', False) if isinstance(telegram_config, dict) else False
+                # Check if telegram is explicitly configured in JSON
+                telegram_enabled_json = telegram_config.get('enabled', None) if isinstance(telegram_config, dict) else None
                 telegram_bot_token_raw = telegram_config.get('bot_token', '').strip() if isinstance(telegram_config, dict) else None
                 telegram_chat_id_raw = telegram_config.get('chat_id', '').strip() if isinstance(telegram_config, dict) else None
                 telegram_message_success = telegram_config.get('message_success') if isinstance(telegram_config, dict) else None
@@ -581,23 +584,43 @@ class SnapshotManager:
                 if telegram_chat_id_raw and telegram_chat_id_raw.lower() not in ['', 'your_telegram_chat_id_here', 'your_telegram_chat_id']:
                     telegram_chat_id = telegram_chat_id_raw
                 
-                # If Telegram is enabled in JSON but credentials are missing, use fallback from config
-                if telegram_enabled and (not telegram_bot_token or not telegram_chat_id):
-                    if hasattr(self, 'logger'):
-                        self.logger.debug(f"[CONFIG] Telegram enabled in JSON for '{server_data.get('name', 'unknown')}' but credentials missing, using fallback from snapshots.config")
-                    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-                        telegram_bot_token = TELEGRAM_BOT_TOKEN
-                        telegram_chat_id = TELEGRAM_CHAT_ID
+                # Determine if Telegram should be enabled
+                # If explicitly enabled in JSON, use it (with fallback credentials if needed)
+                # If not configured in JSON, use global enabled flag
+                if telegram_enabled_json is True:
+                    telegram_enabled = True
+                    # If Telegram is enabled in JSON but credentials are missing, use fallback from config
+                    if not telegram_bot_token or not telegram_chat_id:
                         if hasattr(self, 'logger'):
-                            self.logger.debug(f"[CONFIG] Using fallback Telegram credentials from snapshots.config")
-                    else:
-                        if hasattr(self, 'logger'):
-                            self.logger.error(f"[CONFIG] Telegram enabled in JSON for '{server_data.get('name', 'unknown')}' but no credentials found in JSON or fallback config. Telegram notifications will be skipped.")
-                        telegram_enabled = False  # Disable if no credentials available
+                            self.logger.debug(f"[CONFIG] Telegram enabled in JSON for '{server_data.get('name', 'unknown')}' but credentials missing, using fallback from snapshots.config")
+                        if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+                            telegram_bot_token = TELEGRAM_BOT_TOKEN
+                            telegram_chat_id = TELEGRAM_CHAT_ID
+                            if hasattr(self, 'logger'):
+                                self.logger.debug(f"[CONFIG] Using fallback Telegram credentials from snapshots.config")
+                        else:
+                            if hasattr(self, 'logger'):
+                                self.logger.error(f"[CONFIG] Telegram enabled in JSON for '{server_data.get('name', 'unknown')}' but no credentials found in JSON or fallback config. Telegram notifications will be skipped.")
+                            telegram_enabled = False  # Disable if no credentials available
+                elif telegram_enabled_json is False:
+                    # Explicitly disabled in JSON, don't use global fallback
+                    telegram_enabled = False
+                else:
+                    # Not configured in JSON, use global enabled flag
+                    telegram_enabled = TELEGRAM_ENABLED
+                    if telegram_enabled:
+                        # Use global credentials if per-server credentials are not available
+                        if not telegram_bot_token and TELEGRAM_BOT_TOKEN:
+                            telegram_bot_token = TELEGRAM_BOT_TOKEN
+                        if not telegram_chat_id and TELEGRAM_CHAT_ID:
+                            telegram_chat_id = TELEGRAM_CHAT_ID
+                        if hasattr(self, 'logger') and (telegram_bot_token or telegram_chat_id):
+                            self.logger.debug(f"[CONFIG] Using global Telegram settings for '{server_data.get('name', 'unknown')}'")
                 
                 # Extract optional webhook settings
                 webhook_config = server_data.get('webhook', {})
-                webhook_enabled = webhook_config.get('enabled', False) if isinstance(webhook_config, dict) else False
+                # Check if webhook is explicitly configured in JSON
+                webhook_enabled_json = webhook_config.get('enabled', None) if isinstance(webhook_config, dict) else None
                 webhook_url_raw = webhook_config.get('url', '').strip() if isinstance(webhook_config, dict) else None
                 webhook_payload_success = webhook_config.get('payload_success') if isinstance(webhook_config, dict) else None
                 webhook_payload_failure = webhook_config.get('payload_failure') if isinstance(webhook_config, dict) else None
@@ -607,18 +630,35 @@ class SnapshotManager:
                 if webhook_url_raw and webhook_url_raw.lower() not in ['', 'https://your-webhook-url.com/notify', 'your-webhook-url.com', 'your_webhook_url_here']:
                     webhook_url = webhook_url_raw
                 
-                # If webhook is enabled in JSON but URL is missing, use fallback from config
-                if webhook_enabled and not webhook_url:
-                    if hasattr(self, 'logger'):
-                        self.logger.debug(f"[CONFIG] Webhook enabled in JSON for '{server_data.get('name', 'unknown')}' but URL missing, using fallback from snapshots.config")
-                    if WEBHOOK_URL:
-                        webhook_url = WEBHOOK_URL
+                # Determine if webhook should be enabled
+                # If explicitly enabled in JSON, use it (with fallback URL if needed)
+                # If not configured in JSON, use global enabled flag
+                if webhook_enabled_json is True:
+                    webhook_enabled = True
+                    # If webhook is enabled in JSON but URL is missing, use fallback from config
+                    if not webhook_url:
                         if hasattr(self, 'logger'):
-                            self.logger.debug(f"[CONFIG] Using fallback webhook URL from snapshots.config")
-                    else:
-                        if hasattr(self, 'logger'):
-                            self.logger.error(f"[CONFIG] Webhook enabled in JSON for '{server_data.get('name', 'unknown')}' but no URL found in JSON or fallback config. Webhook notifications will be skipped.")
-                        webhook_enabled = False  # Disable if no URL available
+                            self.logger.debug(f"[CONFIG] Webhook enabled in JSON for '{server_data.get('name', 'unknown')}' but URL missing, using fallback from snapshots.config")
+                        if WEBHOOK_URL:
+                            webhook_url = WEBHOOK_URL
+                            if hasattr(self, 'logger'):
+                                self.logger.debug(f"[CONFIG] Using fallback webhook URL from snapshots.config")
+                        else:
+                            if hasattr(self, 'logger'):
+                                self.logger.error(f"[CONFIG] Webhook enabled in JSON for '{server_data.get('name', 'unknown')}' but no URL found in JSON or fallback config. Webhook notifications will be skipped.")
+                            webhook_enabled = False  # Disable if no URL available
+                elif webhook_enabled_json is False:
+                    # Explicitly disabled in JSON, don't use global fallback
+                    webhook_enabled = False
+                else:
+                    # Not configured in JSON, use global enabled flag
+                    webhook_enabled = WEBHOOK_ENABLED
+                    if webhook_enabled:
+                        # Use global URL if per-server URL is not available
+                        if not webhook_url and WEBHOOK_URL:
+                            webhook_url = WEBHOOK_URL
+                        if hasattr(self, 'logger') and webhook_url:
+                            self.logger.debug(f"[CONFIG] Using global webhook settings for '{server_data.get('name', 'unknown')}'")
                 
                 # Validate and convert data types
                 try:
@@ -907,7 +947,7 @@ class SnapshotManager:
             if action_id:
                 self.logger.debug(f"[DIGITALOCEAN] Snapshot action created (ID: {action_id}), waiting for completion")
                 # Poll for action completion
-                action_status = self._wait_for_digitalocean_action(server.api_token, action_id, timeout=300)
+                action_status = self._wait_for_digitalocean_action(server.api_token, action_id, timeout=SNAPSHOT_CREATION_TIMEOUT)
                 
                 if action_status == "completed":
                     self.logger.info(f"  ✓ Snapshot created successfully: {snapshot_name}")
@@ -996,7 +1036,7 @@ class SnapshotManager:
             if action.get("id") and image.get("id"):
                 self.logger.debug(f"[HETZNER] Snapshot action created (Action ID: {action.get('id')}, Image ID: {image.get('id')})")
                 # Hetzner snapshots are usually created synchronously, but we can wait for the action
-                action_status = self._wait_for_hetzner_action(server.api_token, action.get("id"), timeout=300)
+                action_status = self._wait_for_hetzner_action(server.api_token, action.get("id"), timeout=SNAPSHOT_CREATION_TIMEOUT)
                 
                 if action_status == "success":
                     self.logger.info(f"  ✓ Snapshot created successfully: {snapshot_name}")
@@ -1221,6 +1261,8 @@ class SnapshotManager:
         
         # Send Telegram notification if enabled for this server
         self.logger.debug(f"[NOTIFICATIONS] Checking Telegram notification configuration")
+        # Only send if explicitly enabled (either per-server or global fallback)
+        # Don't send if global enabled is False, even if credentials exist
         if server.telegram_enabled:
             if server.telegram_bot_token and server.telegram_chat_id:
                 self.logger.debug(f"[NOTIFICATIONS] Using Telegram credentials for server '{server.name}'")
@@ -1296,11 +1338,13 @@ class SnapshotManager:
                     
                     send_telegram_notification(notification_data, self.logger, custom_message=custom_message)
                 else:
-                    self.logger.error(f"[NOTIFICATIONS] Telegram enabled for server '{server.name}' but no credentials available. Skipping Telegram notification.")
+                    self.logger.debug(f"[NOTIFICATIONS] Telegram notifications skipped - no credentials available for server '{server.name}'")
         else:
             self.logger.debug(f"[NOTIFICATIONS] Telegram notifications skipped (not enabled for server '{server.name}')")
         
         # Send webhook notification if enabled for this server
+        # Only send if explicitly enabled (either per-server or global fallback)
+        # Don't send if global enabled is False, even if URL exists
         webhook_url_to_use = None
         if server.webhook_enabled:
             if server.webhook_url:
@@ -1313,7 +1357,9 @@ class SnapshotManager:
                     self.logger.debug(f"[NOTIFICATIONS] Using global webhook URL (fallback) for server '{server.name}'")
                     webhook_url_to_use = WEBHOOK_URL
                 else:
-                    self.logger.error(f"[NOTIFICATIONS] Webhook enabled for server '{server.name}' but no URL available. Skipping webhook notification.")
+                    self.logger.debug(f"[NOTIFICATIONS] Webhook notifications skipped - no URL available for server '{server.name}'")
+        else:
+            self.logger.debug(f"[NOTIFICATIONS] Webhook notifications skipped (not enabled for server '{server.name}')")
         
         if webhook_url_to_use:
             self.logger.debug(f"[NOTIFICATIONS] Preparing webhook notification")
@@ -1392,19 +1438,17 @@ class SnapshotManager:
         self.logger.debug(f"  API token configured: Yes (masked: {masked_token})")
         
         # Log notification settings
+        # Note: server.telegram_enabled and server.webhook_enabled already reflect
+        # the correct state (per-server enabled OR global enabled when not configured)
+        # If global enabled=false, these will be False even if credentials/URL exist
         notifications = []
         if server.telegram_enabled and server.telegram_bot_token and server.telegram_chat_id:
-            notifications.append("Telegram (per-server)")
-        elif TELEGRAM_ENABLED and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-            notifications.append("Telegram (global)")
+            notifications.append("Telegram")
         
         webhook_url_to_use = None
         if server.webhook_enabled and server.webhook_url:
-            notifications.append("Webhook (per-server)")
+            notifications.append("Webhook")
             webhook_url_to_use = server.webhook_url
-        elif WEBHOOK_ENABLED and WEBHOOK_URL:
-            notifications.append("Webhook (global)")
-            webhook_url_to_use = WEBHOOK_URL
         
         if notifications:
             self.logger.info(f"  Notifications: {', '.join(notifications)}")
@@ -1492,13 +1536,19 @@ class SnapshotManager:
         self.logger.info(f"SUMMARY: {success_count} succeeded, {failure_count} failed out of {len(self.servers)} total")
         self.logger.info("=" * 80)
         
+        # Print summary to stderr (will appear in cronjob.log)
+        summary_msg = f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] SUMMARY: {success_count} succeeded, {failure_count} failed out of {len(self.servers)} total"
+        print(summary_msg, file=sys.stderr)
+        
         # Exit with error code if all failed, or if any failed (for cron monitoring)
         if failure_count > 0:
             if success_count == 0:
                 self.logger.error("All servers failed")
+                print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ERROR: All servers failed", file=sys.stderr)
                 sys.exit(1)
             else:
                 self.logger.warning(f"Partial failure: {failure_count} server(s) failed")
+                print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] WARNING: Partial failure: {failure_count} server(s) failed", file=sys.stderr)
                 sys.exit(2)  # Partial failure
 
 def parse_arguments() -> argparse.Namespace:
@@ -1527,6 +1577,7 @@ def acquire_lock():
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             # Write PID to lock file
             os.write(lock_fd, str(os.getpid()).encode())
+            print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Lock acquired successfully (PID: {os.getpid()})", file=sys.stderr)
             return lock_fd
         except BlockingIOError:
             os.close(lock_fd)
@@ -1550,6 +1601,9 @@ def release_lock(lock_fd):
 
 def main():
     args = parse_arguments()
+    
+    # Print startup message to stderr (will appear in cronjob.log)
+    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Starting snapshot management script...", file=sys.stderr)
 
     # Ensure directories exist
     if not os.path.isdir(CONFIGS_DIR):
@@ -1572,9 +1626,16 @@ def main():
                 print(f"WARNING: No '.json' configuration files found in the '{CONFIGS_DIR}' directory.", file=sys.stderr)
                 sys.exit(0)  # Exit successfully if no configs (might be intentional)
 
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Found {len(config_files)} configuration file(s).", file=sys.stderr)
+        
         # Initialize the SnapshotManager with the provided configuration files
         manager = SnapshotManager(config_paths=config_files, verbose=args.verbose)
         manager.run()
+        
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Script completed successfully.", file=sys.stderr)
+    except Exception as e:
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ERROR: Script failed with exception: {e}", file=sys.stderr)
+        raise
     finally:
         # Always release lock
         if lock_fd is not None:
