@@ -1,0 +1,13 @@
+[Unit]
+Description=Daily cloud server snapshots
+
+[Timer]
+# Daily at 03:00 local time, change as needed (see 'man systemd.time')
+OnCalendar=*-*-* 03:00:00
+# Spread the start a little to avoid fixed load peaks at the providers
+RandomizedDelaySec=10min
+# Catch up on a run missed while the Pi was switched off
+Persistent=true
+
+[Install]
+WantedBy=timers.target

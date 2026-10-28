@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+import signal
 import socket
 import sys
 import time
@@ -56,6 +57,13 @@ class ProviderError(Exception):
     def __init__(self, message: str, status_code: Optional[int] = None):
         super().__init__(message)
         self.status_code = status_code
+
+
+class Terminated(BaseException):
+    """
+    SIGTERM received (systemd timeout, shutdown, 'systemctl stop'). Derived from BaseException so
+    the per-server error handling does not swallow it and the run stops right away.
+    """
 
 
 # ============================================================================
@@ -975,6 +983,10 @@ def release_lock(fd: int):
     os.close(fd)
 
 
+def raise_terminated(signum, frame):
+    raise Terminated()
+
+
 def parse_arguments(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Manage snapshots for DigitalOcean droplets and Hetzner Cloud servers.")
     parser.add_argument("configs", nargs="*",
@@ -1004,6 +1016,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     notifier = Notifier(settings)
     started = time.monotonic()
+    signal.signal(signal.SIGTERM, raise_terminated)
     try:
         logger.info(f"=== {SCRIPT_NAME} {__version__} started{' (dry run)' if args.dry_run else ''} ===")
         if not os.path.isdir(settings.configs_dir):
@@ -1024,12 +1037,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         if not args.dry_run:
             notifier.run_finished(False, f"Configuration error: {e}")
         return 1
+    except Terminated:
+        # Ignore a second SIGTERM so the down heartbeat still gets out
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        logger.error("Stopped by SIGTERM (systemd timeout, shutdown or manual stop)")
+        if not args.dry_run:
+            notifier.run_finished(False, "Stopped: terminated before all servers were processed")
+        return 1
     except Exception as e:
         logger.exception("Unexpected error")
         if not args.dry_run:
             notifier.run_finished(False, f"Crashed: {type(e).__name__}: {e}")
         return 1
     finally:
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
         release_lock(lock_fd)
 
 

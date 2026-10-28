@@ -33,6 +33,8 @@ unattended on small hardware such as a Raspberry Pi 3.
 - **Small, rarely written log file** to protect SD cards; file logging can be switched off
 - **Dry run** to check what would happen without changing anything
 - **Lock file** prevents two runs at the same time
+- **systemd service and timer** with time-sync wait, catch-up after downtime, timeout and hardening;
+  a stopped or timed-out run still reports `down` to the heartbeat
 
 ## How it works
 
@@ -59,10 +61,14 @@ snapshots are deleted and the server counts as failed. The next run cleans up as
 
 ## Installation
 
-Raspberry Pi OS (or any Linux) with Python 3.9 or newer:
+**Raspberry Pi with systemd: follow [docs/deploy_git.md](docs/deploy_git.md)**, it covers every
+step from `git clone` to configuration, Uptime Kuma, the systemd timer, testing and updates.
+
+Short version for any Linux with Python 3.9 or newer:
 
 ```bash
-sudo apt install python3-venv git
+sudo apt install git python3-venv
+mkdir -p ~/python && cd ~/python
 git clone https://github.com/drhdev/mdosnapshots.git snapshots
 cd snapshots
 python3 -m venv venv
@@ -155,73 +161,23 @@ Usable in Telegram messages and in string values of webhook payloads:
 ## Heartbeat with Uptime Kuma
 
 The heartbeat tells you both when a snapshot failed **and** when the script did not run at all,
-e.g. because the Raspberry Pi is off, the SD card died or the cron job is missing.
+e.g. because the Raspberry Pi is off, the SD card died or the timer is disabled.
 
-After every run the script calls the push URL:
+After every run the script calls the push URL from `[HEARTBEAT]`:
 
 | Situation | Sent to Uptime Kuma |
 |---|---|
 | All snapshots created | `status=up`, `msg=OK: 12/12 snapshots created in 47min` |
 | At least one snapshot failed | `status=down`, `msg=FAILED 1/12 in 52min: web-1` |
-| Configuration error or crash | `status=down`, `msg=Configuration error: ...` / `Crashed: ...` |
+| Configuration error, crash or stopped (systemd timeout, shutdown) | `status=down` with the reason |
 | Script did not run | nothing; Uptime Kuma marks the monitor down when the interval passes |
 
-`--dry-run` and a second instance blocked by the lock file send no heartbeat.
+`--dry-run` and a second instance blocked by the lock file send no heartbeat. The push URL can be
+pasted as copied from Uptime Kuma; the script replaces `status`, `msg` and `ping`. Optionally each
+server reports to its own monitor via `"heartbeat": {"url": ...}` in its JSON file.
 
-### 1. Create the push monitor in Uptime Kuma
-
-1. In Uptime Kuma click **Add New Monitor**
-2. **Monitor Type**: `Push`
-3. **Friendly Name**: e.g. `Snapshots (Raspberry Pi)`
-4. **Push URL**: shown by Uptime Kuma, e.g.
-   `https://uptime.example.com/api/push/AbCdEf1234?status=up&msg=OK&ping=`
-   Copy it with the **Copy** button.
-5. **Heartbeat Interval**: time between two runs plus the maximum run time.
-   For a daily run use `90000` (25 hours).
-   If your Uptime Kuma version does not accept more than `86400`, enter `86400` and use
-   the retry settings below as buffer.
-6. **Retries**: `1`
-7. **Heartbeat Retry Interval**: `7200` (2 hours). Uptime Kuma first shows the monitor as
-   *Pending* and only alerts after this extra time, which absorbs runs that take longer than usual.
-8. Under **Notifications**, enable the channels Uptime Kuma should alert (e.g. Telegram, e-mail)
-9. Click **Save**
-
-The monitor stays *Pending* until the first push arrives.
-
-### 2. Enter the push URL in `snapshots.config`
-
-```ini
-[HEARTBEAT]
-enabled = true
-url = https://uptime.example.com/api/push/AbCdEf1234?status=up&msg=OK&ping=
-```
-
-You can paste the URL exactly as copied: the script replaces `status`, `msg` and `ping` itself.
-The URL contains the push token, so it is treated as a secret and masked in the log.
-
-### 3. Test it
-
-Send a manual test push, then run the script once:
-
-```bash
-curl "https://uptime.example.com/api/push/AbCdEf1234?status=up&msg=manual-test"
-venv/bin/python snapshots.py --verbose
-```
-
-In Uptime Kuma the monitor should turn green and show the message
-`OK: ... snapshots created in ...`.
-
-### Optional: one monitor per server
-
-To see each server separately in Uptime Kuma, create one push monitor per server (same interval
-settings) and enter its URL in the server file:
-
-```json
-"heartbeat": { "enabled": true, "url": "https://uptime.example.com/api/push/Server1Token" }
-```
-
-The per-server heartbeat reports `OK: <snapshot>, <n> snapshots exist` or `FAILED: <error>`.
-The global heartbeat in `snapshots.config` keeps reporting the run as a whole.
+How to create the push monitor and which interval to use:
+[docs/deploy_git.md, step 7](docs/deploy_git.md#7-uptime-kuma-push-monitor).
 
 ## Running it
 
@@ -234,62 +190,13 @@ venv/bin/python snapshots.py --dry-run -v     # show what would happen, change n
 Run `--dry-run -v` once after setting up or changing a server: it lists the snapshots the
 script considers its own and which ones would be deleted.
 
-### Daily with a systemd timer (recommended on a Raspberry Pi)
+For daily runs use the systemd service and timer in [`deploy/systemd/`](deploy/systemd/), installed
+with `./deploy/install-systemd.sh`. Compared to cron, systemd waits for network and a synchronised
+clock (the Raspberry Pi has no hardware clock), catches up on runs missed while the Pi was off,
+stops hanging runs and keeps the service away from the rest of the system.
 
-The Raspberry Pi has no hardware clock. A systemd timer waits until the time is synchronised
-and catches up on runs missed while the Pi was off.
-
-`/etc/systemd/system/snapshots.service`:
-
-```ini
-[Unit]
-Description=Cloud server snapshots
-Wants=network-online.target time-sync.target
-After=network-online.target time-sync.target
-
-[Service]
-Type=oneshot
-User=pi
-WorkingDirectory=/home/pi/snapshots
-ExecStart=/home/pi/snapshots/venv/bin/python snapshots.py
-```
-
-`/etc/systemd/system/snapshots.timer`:
-
-```ini
-[Unit]
-Description=Daily cloud server snapshots
-
-[Timer]
-OnCalendar=*-*-* 03:00:00
-RandomizedDelaySec=10min
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-```
-
-Adjust `User` and the paths to your installation, then enable the timer:
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now snapshots.timer
-```
-
-Check when it runs next and what the last run did:
-
-```bash
-systemctl list-timers snapshots.timer
-journalctl -u snapshots.service -n 50
-```
-
-### Daily with cron
-
-```cron
-0 3 * * * cd /home/pi/snapshots && venv/bin/python snapshots.py
-```
-
-Without `--verbose` the console only gets warnings and errors, so cron stays quiet on success.
+**Step-by-step guide** from `git clone` to configuration, Uptime Kuma, systemd, testing and updates
+with `git pull`: [docs/deploy_git.md](docs/deploy_git.md).
 
 ## Logging
 
@@ -310,7 +217,7 @@ FINAL_STATUS | hetzner | web-1 | SUCCESS | web-1-20250101030012 | 4 snapshots | 
 | Code | Meaning |
 |---|---|
 | `0` | All snapshots created |
-| `1` | All servers failed, no valid configuration, or unexpected error |
+| `1` | All servers failed, no valid configuration, unexpected error, or stopped by SIGTERM |
 | `2` | Some servers failed |
 | `3` | Another instance is already running |
 

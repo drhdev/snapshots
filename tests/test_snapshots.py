@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import signal
 from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlsplit
 
@@ -618,6 +619,21 @@ class TestMain:
         monkeypatch.setitem(snapshots.PROVIDERS, "digitalocean", lambda server: provider)
         assert snapshots.main(["--dry-run"]) == 0
         assert heartbeats == [] and provider.created == []
+
+    def test_sigterm_stops_run_and_reports_down(self, project, monkeypatch):
+        tmp_path, heartbeats = project
+        write_json(tmp_path / "configs", "a.json", server_json())
+        write_json(tmp_path / "configs", "b.json", server_json(id="456", name="web-2"))
+        processed = []
+
+        class Stopping(FakeProvider):
+            def list_snapshots(self):
+                processed.append(1)
+                os.kill(os.getpid(), signal.SIGTERM)  # real signal, handled by main()
+        monkeypatch.setitem(snapshots.PROVIDERS, "digitalocean", lambda server: Stopping([]))
+        assert snapshots.main([]) == 1
+        assert len(processed) == 1  # second server not started
+        assert heartbeats == [(False, "Stopped: terminated before all servers were processed")]
 
     def test_second_instance_exits_with_3(self, project):
         tmp_path, heartbeats = project

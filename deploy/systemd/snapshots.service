@@ -1,0 +1,25 @@
+# Template, installed by deploy/install-systemd.sh which replaces __USER__ and __DIR__.
+[Unit]
+Description=Cloud server snapshots (DigitalOcean, Hetzner Cloud)
+Documentation=https://github.com/drhdev/mdosnapshots
+# Wait for network and a synchronised clock (the Raspberry Pi has no hardware clock)
+Wants=network-online.target time-sync.target
+After=network-online.target time-sync.target
+
+[Service]
+Type=oneshot
+User=__USER__
+WorkingDirectory=__DIR__
+ExecStart=__DIR__/venv/bin/python __DIR__/snapshots.py
+# Stop a hanging run; snapshots.py then reports "down" to the heartbeat monitor.
+# Must be longer than: number of servers x (snapshot_creation_timeout + delay_between_servers)
+TimeoutStartSec=12h
+# Stay out of the way of other services on the Pi
+Nice=10
+IOSchedulingClass=idle
+# Hardening: read-only system, writable logs directory only
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=__DIR__/logs
