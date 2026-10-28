@@ -52,7 +52,7 @@ has no hardware clock and gets its time from the network after every boot.
 ```bash
 mkdir -p ~/python
 cd ~/python
-git clone https://github.com/drhdev/mdosnapshots.git snapshots
+git clone https://github.com/drhdev/snapshots.git snapshots
 cd ~/python/snapshots
 ```
 

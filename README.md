@@ -69,7 +69,7 @@ Short version for any Linux with Python 3.9 or newer:
 ```bash
 sudo apt install git python3-venv
 mkdir -p ~/python && cd ~/python
-git clone https://github.com/drhdev/mdosnapshots.git snapshots
+git clone https://github.com/drhdev/snapshots.git snapshots
 cd snapshots
 python3 -m venv venv
 venv/bin/pip install -r requirements.txt

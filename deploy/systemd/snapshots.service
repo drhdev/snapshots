@@ -1,7 +1,7 @@
 # Template, installed by deploy/install-systemd.sh which replaces __USER__ and __DIR__.
 [Unit]
 Description=Cloud server snapshots (DigitalOcean, Hetzner Cloud)
-Documentation=https://github.com/drhdev/mdosnapshots
+Documentation=https://github.com/drhdev/snapshots
 # Wait for network and a synchronised clock (the Raspberry Pi has no hardware clock)
 Wants=network-online.target time-sync.target
 After=network-online.target time-sync.target
