@@ -168,6 +168,9 @@ cython_debug/
 !*.sample
 !*.config.sample
 !*.json.sample
+# Server configs in any form (e.g. parked as *.offline) contain API tokens
+configs/*
+!configs/*.json.sample
 
 # Log files
 logs/

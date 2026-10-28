@@ -436,6 +436,7 @@ class TestSnapshotManager:
         ok, bad = ServerResult(make_server(name="a"), True), ServerResult(make_server(name="b"), False)
         assert snapshots.run_summary([ok], 120).startswith("OK: 1/1")
         assert snapshots.run_summary([ok, bad], 120) == "FAILED 1/2 in 2min: b"
+        assert snapshots.run_summary([ok], 120, dry_run=True) == "OK: 1/1 servers checked (dry run) in 2min"
 
 
 # ----------------------------------------------------------------------------

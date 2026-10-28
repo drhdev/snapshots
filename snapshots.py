@@ -927,11 +927,12 @@ def exit_code(results: List[ServerResult]) -> int:
     return 2 if failed else 0
 
 
-def run_summary(results: List[ServerResult], duration: float) -> str:
+def run_summary(results: List[ServerResult], duration: float, dry_run: bool = False) -> str:
     failed = [r.server.name for r in results if not r.success]
     minutes = f"{duration / 60:.0f}min"
     if not failed:
-        return f"OK: {len(results)}/{len(results)} snapshots created in {minutes}"
+        done = "servers checked (dry run)" if dry_run else "snapshots created"
+        return f"OK: {len(results)}/{len(results)} {done} in {minutes}"
     return f"FAILED {len(failed)}/{len(results)} in {minutes}: {', '.join(failed)}"
 
 
@@ -1027,7 +1028,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         results = SnapshotManager(settings, servers, notifier).run(dry_run=args.dry_run)
         code = exit_code(results)
-        summary = run_summary(results, time.monotonic() - started)
+        summary = run_summary(results, time.monotonic() - started, dry_run=args.dry_run)
         logger.log(logging.INFO if code == 0 else logging.ERROR, f"=== {summary} ===")
         if not args.dry_run:
             notifier.run_finished(code == 0, summary)
