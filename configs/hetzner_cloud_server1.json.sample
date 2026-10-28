@@ -10,7 +10,7 @@
       "bot_token": "your_telegram_bot_token_here",
       "chat_id": "your_telegram_chat_id_here",
       "message_success": "*Snapshot Success*\nServer: `{server_name}`\nSnapshot: `{snapshot_name}`\nTotal: `{total_snapshots}` snapshots",
-      "message_failure": "*Snapshot Failed*\nServer: `{server_name}`\nError occurred during snapshot creation"
+      "message_failure": "*Snapshot Failed*\nServer: `{server_name}`\nError: `{error}`"
     },
     "webhook": {
       "enabled": true,
@@ -25,7 +25,8 @@
         "timestamp": "{timestamp}",
         "snapshot_name": "{snapshot_name}",
         "total_snapshots": "{total_snapshots}",
-        "snapshot_info": "{snapshot_info}"
+        "snapshot_info": "{snapshot_info}",
+        "error": "{error}"
       },
       "payload_failure": {
         "script": "{script}",
@@ -37,9 +38,13 @@
         "timestamp": "{timestamp}",
         "snapshot_name": "{snapshot_name}",
         "total_snapshots": "{total_snapshots}",
-        "snapshot_info": "{snapshot_info}"
+        "snapshot_info": "{snapshot_info}",
+        "error": "{error}"
       }
+    },
+    "heartbeat": {
+      "enabled": false,
+      "url": "https://uptime.example.com/api/push/your_push_token"
     }
   }
 }
-

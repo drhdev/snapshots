@@ -1,418 +1,315 @@
 #!/usr/bin/env python3
 # snapshots.py
-# Version: 0.3
+# Version: 0.4
 # Author: drhdev
 # License: GPL v3
 #
 # Description:
-# This script manages snapshots for multiple DigitalOcean droplets and Hetzner Cloud servers, including creation, retention, and deletion.
-# Configuration is handled via JSON files located in the 'configs' subfolder, allowing individual settings per server.
-# Telegram notifications are automatically sent after each server's snapshot management completes (if enabled in config).
+# Creates snapshots for DigitalOcean droplets and Hetzner Cloud servers, applies a retention
+# policy, sends Telegram/webhook notifications and reports to a heartbeat monitor (e.g. Uptime Kuma).
+# Server settings live in JSON files in 'configs/', global settings in 'snapshots.config'.
 
-import logging
-from logging.handlers import RotatingFileHandler
-import datetime
-import os
-import sys
-import configparser
-import json
-import time
 import argparse
+import configparser
+import datetime
 import fcntl
+import json
+import logging
+import os
 import re
+import socket
+import sys
+import time
+from dataclasses import dataclass, field
+from logging.handlers import RotatingFileHandler
+from typing import Callable, Dict, List, Optional
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
 import requests
-from dataclasses import dataclass
-from typing import List, Optional
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-# Get project directory (where this script is located)
+__version__ = "0.4"
+SCRIPT_NAME = "snapshots.py"
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# Configuration file path (relative to project directory)
 CONFIG_FILE = os.path.join(PROJECT_DIR, "snapshots.config")
 
-def load_config() -> configparser.ConfigParser:
-    """Load configuration from INI file with defaults."""
-    config = configparser.ConfigParser()
-    
-    # Set defaults
-    defaults = {
-        'DIRECTORIES': {
-            'configs_dir': 'configs',
-            'logs_dir': 'logs'
-        },
-        'FILES': {
-            'log_file': 'snapshots.log',
-            'lock_file': 'snapshots.lock'
-        },
-        'TIMING': {
-            'delay_between_servers': '5',
-            'snapshot_creation_timeout': '900'  # 15 minutes in seconds
-        },
-        'LOGGING': {
-            'max_bytes': '5242880',
-            'backup_count': '5',
-            'level': 'DEBUG'
-        },
-        'TELEGRAM': {
-            'enabled': 'true',
-            'bot_token': '',
-            'chat_id': '',
-            'timeout': '10',
-            'retries': '3',
-            'base_delay_between_retries': '2',
-            'message_success': '*Snapshot Success*\\nServer: `{server_name}`\\nSnapshot: `{snapshot_name}`\\nTotal: `{total_snapshots}` snapshots',
-            'message_failure': '*Snapshot Failed*\\nServer: `{server_name}`\\nError occurred during snapshot creation'
-        },
-        'WEBHOOK': {
-            'enabled': 'false',
-            'url': '',
-            'timeout': '10',
-            'retries': '3',
-            'base_delay_between_retries': '2',
-            'payload_success': '{"script": "{script}", "provider": "{provider}", "server": "{server_name}", "server_id": "{server_id}", "status": "{status}", "hostname": "{hostname}", "timestamp": "{timestamp}", "snapshot_name": "{snapshot_name}", "total_snapshots": "{total_snapshots}", "snapshot_info": "{snapshot_info}"}',
-            'payload_failure': '{"script": "{script}", "provider": "{provider}", "server": "{server_name}", "server_id": "{server_id}", "status": "{status}", "hostname": "{hostname}", "timestamp": "{timestamp}", "snapshot_name": "{snapshot_name}", "total_snapshots": "{total_snapshots}", "snapshot_info": "{snapshot_info}"}'
-        }
-    }
-    
-    # Set defaults first
-    for section, options in defaults.items():
-        config.add_section(section)
-        for key, value in options.items():
-            config.set(section, key, value)
-    
-    # Load from file if it exists
-    if os.path.exists(CONFIG_FILE):
-        try:
-            config.read(CONFIG_FILE)
-        except Exception as e:
-            print(f"WARNING: Failed to load config file '{CONFIG_FILE}': {e}. Using defaults.", file=sys.stderr)
-    
-    return config
+# Timeout for a single API request (seconds)
+API_REQUEST_TIMEOUT = 30
+TELEGRAM_API_URL = "https://api.telegram.org"
+# Uptime Kuma accepts longer messages, but short ones stay readable in the UI and in alerts
+HEARTBEAT_MESSAGE_LIMIT = 200
 
-# Load configuration
-_CONFIG = load_config()
+# JSON top-level key -> provider name
+CONFIG_KEYS = {"digitalocean_droplet": "digitalocean", "hetzner_cloud_server": "hetzner"}
 
-# Constants (loaded from config, all paths relative to project directory)
-CONFIGS_DIR = os.path.join(PROJECT_DIR, _CONFIG.get('DIRECTORIES', 'configs_dir', fallback='configs'))
-LOGS_DIR = os.path.join(PROJECT_DIR, _CONFIG.get('DIRECTORIES', 'logs_dir', fallback='logs'))
-DEFAULT_CONFIG_FILE = os.path.join(CONFIGS_DIR, "config.json")
-LOG_FILE = os.path.join(LOGS_DIR, _CONFIG.get('FILES', 'log_file', fallback='snapshots.log'))
-LOCK_FILE = os.path.join(LOGS_DIR, _CONFIG.get('FILES', 'lock_file', fallback='snapshots.lock'))
-DELAY_BETWEEN_SERVERS = _CONFIG.getint('TIMING', 'delay_between_servers', fallback=20)
-SNAPSHOT_CREATION_TIMEOUT = _CONFIG.getint('TIMING', 'snapshot_creation_timeout', fallback=900)  # 15 minutes default
-LOG_MAX_BYTES = _CONFIG.getint('LOGGING', 'max_bytes', fallback=5242880)
-LOG_BACKUP_COUNT = _CONFIG.getint('LOGGING', 'backup_count', fallback=5)
-LOG_LEVEL = getattr(logging, _CONFIG.get('LOGGING', 'level', fallback='DEBUG').upper(), logging.DEBUG)
+logger = logging.getLogger("snapshots")
 
-# Telegram configuration (global fallback - used when not set in server JSON files)
-TELEGRAM_ENABLED = _CONFIG.getboolean('TELEGRAM', 'enabled', fallback=True)
-TELEGRAM_BOT_TOKEN = _CONFIG.get('TELEGRAM', 'bot_token', fallback='').strip() or None
-TELEGRAM_CHAT_ID = _CONFIG.get('TELEGRAM', 'chat_id', fallback='').strip() or None
-TELEGRAM_TIMEOUT = _CONFIG.getint('TELEGRAM', 'timeout', fallback=10)
-TELEGRAM_RETRIES = _CONFIG.getint('TELEGRAM', 'retries', fallback=3)
-TELEGRAM_BASE_DELAY_BETWEEN_RETRIES = _CONFIG.getint('TELEGRAM', 'base_delay_between_retries', fallback=2)
 
-# Helper function to decode escape sequences in config strings
-def decode_config_string(s: str) -> str:
-    """Decode escape sequences like \\n to actual newlines."""
-    if not s:
-        return s
-    return s.encode().decode('unicode_escape')
+class ConfigError(Exception):
+    """Invalid or incomplete configuration."""
 
-TELEGRAM_MESSAGE_SUCCESS = decode_config_string(_CONFIG.get('TELEGRAM', 'message_success', fallback='').strip()) or None
-TELEGRAM_MESSAGE_FAILURE = decode_config_string(_CONFIG.get('TELEGRAM', 'message_failure', fallback='').strip()) or None
 
-# Set Telegram API URL if credentials are available
-if TELEGRAM_ENABLED and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-    TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-else:
-    TELEGRAM_API_URL = None
-    if TELEGRAM_ENABLED:
-        # Only warn if Telegram is enabled but credentials are missing
-        pass  # Will be checked later when actually trying to send
+class ProviderError(Exception):
+    """A cloud provider API call failed."""
 
-# Webhook configuration (global fallback)
-WEBHOOK_ENABLED = _CONFIG.getboolean('WEBHOOK', 'enabled', fallback=False)
-WEBHOOK_URL = _CONFIG.get('WEBHOOK', 'url', fallback='').strip() or None
-WEBHOOK_TIMEOUT = _CONFIG.getint('WEBHOOK', 'timeout', fallback=10)
-WEBHOOK_RETRIES = _CONFIG.getint('WEBHOOK', 'retries', fallback=3)
-WEBHOOK_BASE_DELAY_BETWEEN_RETRIES = _CONFIG.getint('WEBHOOK', 'base_delay_between_retries', fallback=2)
-WEBHOOK_PAYLOAD_SUCCESS = _CONFIG.get('WEBHOOK', 'payload_success', fallback='').strip() or None
-WEBHOOK_PAYLOAD_FAILURE = _CONFIG.get('WEBHOOK', 'payload_failure', fallback='').strip() or None
+    def __init__(self, message: str, status_code: Optional[int] = None):
+        super().__init__(message)
+        self.status_code = status_code
 
-def sanitize_log_output(text: str, api_token: str = None) -> str:
+
+# ============================================================================
+# Secret redaction
+# ============================================================================
+
+class SecretRedactor(logging.Filter):
     """
-    Remove credentials and sensitive information from log output.
-    Masks API tokens, passwords, and other sensitive patterns.
+    Removes registered secrets (API tokens, bot tokens, webhook and heartbeat URLs) from log
+    records and notification texts. For URLs the path and query are registered as well, because
+    HTTP error messages often contain only the path (e.g. "Max retries exceeded with url: /...").
     """
-    if not text:
-        return text
-    
-    # Mask API tokens (DigitalOcean tokens are typically long alphanumeric strings)
-    if api_token:
-        text = text.replace(api_token, api_token[:6] + '...' + api_token[-6:] if len(api_token) > 12 else '***')
-    
-    # Mask common token patterns (long alphanumeric strings that might be tokens)
-    # Pattern for potential tokens: long alphanumeric strings (20+ chars)
-    token_pattern = r'\b([A-Za-z0-9]{20,})\b'
-    def mask_token(match):
-        token = match.group(1)
-        # Don't mask if it looks like a snapshot ID or droplet ID (usually shorter)
-        if len(token) < 20:
-            return token
-        return token[:6] + '...' + token[-6:]
-    
-    text = re.sub(token_pattern, mask_token, text)
-    
-    # Mask common credential patterns
-    credential_patterns = [
-        (r'api[_-]?token["\']?\s*[:=]\s*["\']?([A-Za-z0-9_-]{10,})["\']?', r'api_token="***"'),
-        (r'bot[_-]?token["\']?\s*[:=]\s*["\']?([A-Za-z0-9_-]{10,})["\']?', r'bot_token="***"'),
-        (r'password["\']?\s*[:=]\s*["\']?([^\s"\']+)["\']?', r'password="***"'),
-        (r'secret["\']?\s*[:=]\s*["\']?([A-Za-z0-9_-]{10,})["\']?', r'secret="***"'),
+
+    PATTERNS = [
+        (re.compile(r"bot\d+:[\w-]+"), "bot***"),
+        (re.compile(r"(Bearer\s+)\S+", re.IGNORECASE), r"\1***"),
     ]
-    
-    for pattern, replacement in credential_patterns:
-        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
-    
+
+    def __init__(self):
+        super().__init__()
+        self._secrets = set()
+
+    def add(self, secret: Optional[str]):
+        if not secret:
+            return
+        self._secrets.add(secret)
+        if "://" in secret:
+            parts = urlsplit(secret)
+            if len(parts.path) > 1:
+                self._secrets.add(parts.path)
+            if parts.query:
+                self._secrets.add(parts.query)
+
+    def redact(self, text: Optional[str]) -> str:
+        if not text:
+            return text or ""
+        # Longest first, so a full URL is replaced before its path
+        for secret in sorted(self._secrets, key=len, reverse=True):
+            text = text.replace(secret, "***")
+        for pattern, replacement in self.PATTERNS:
+            text = pattern.sub(replacement, text)
+        return text
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = self.redact(record.getMessage())
+        record.args = ()
+        if record.exc_info:
+            record.exc_text = self.redact(logging.Formatter().formatException(record.exc_info))
+            record.exc_info = None
+        return True
+
+
+REDACTOR = SecretRedactor()
+
+
+# ============================================================================
+# Settings (snapshots.config)
+# ============================================================================
+
+DEFAULT_SETTINGS = {
+    "DIRECTORIES": {"configs_dir": "configs", "logs_dir": "logs"},
+    "FILES": {"log_file": "snapshots.log", "lock_file": "snapshots.lock"},
+    "TIMING": {"delay_between_servers": "20", "snapshot_creation_timeout": "3600", "action_poll_interval": "15"},
+    "LOGGING": {"file_enabled": "true", "level": "INFO", "max_bytes": "1048576", "backup_count": "2"},
+    "TELEGRAM": {"enabled": "true", "bot_token": "", "chat_id": "", "timeout": "10", "retries": "3",
+                 "base_delay_between_retries": "2", "message_success": "", "message_failure": ""},
+    "WEBHOOK": {"enabled": "false", "url": "", "timeout": "10", "retries": "3",
+                "base_delay_between_retries": "2", "payload_success": "", "payload_failure": ""},
+    "HEARTBEAT": {"enabled": "false", "url": "", "timeout": "10", "retries": "3", "base_delay_between_retries": "2"},
+}
+
+
+@dataclass(frozen=True)
+class Delivery:
+    """How to deliver an outgoing notification: request timeout and attempts with exponential backoff."""
+    timeout: float = 10
+    retries: int = 3
+    base_delay: float = 2
+
+
+@dataclass
+class TelegramSettings:
+    enabled: bool = True
+    bot_token: Optional[str] = None
+    chat_id: Optional[str] = None
+    message_success: Optional[str] = None
+    message_failure: Optional[str] = None
+    delivery: Delivery = Delivery()
+
+
+@dataclass
+class WebhookSettings:
+    enabled: bool = False
+    url: Optional[str] = None
+    payload_success: Optional[dict] = None
+    payload_failure: Optional[dict] = None
+    delivery: Delivery = Delivery()
+
+
+@dataclass
+class HeartbeatSettings:
+    enabled: bool = False
+    url: Optional[str] = None
+    delivery: Delivery = Delivery()
+
+
+@dataclass
+class Settings:
+    configs_dir: str = os.path.join(PROJECT_DIR, "configs")
+    log_file: str = os.path.join(PROJECT_DIR, "logs", "snapshots.log")
+    lock_file: str = os.path.join(PROJECT_DIR, "logs", "snapshots.lock")
+    delay_between_servers: float = 20
+    snapshot_creation_timeout: float = 3600
+    action_poll_interval: float = 15
+    log_to_file: bool = True
+    log_level: int = logging.INFO
+    log_max_bytes: int = 1048576
+    log_backup_count: int = 2
+    telegram: TelegramSettings = field(default_factory=TelegramSettings)
+    webhook: WebhookSettings = field(default_factory=WebhookSettings)
+    heartbeat: HeartbeatSettings = field(default_factory=HeartbeatSettings)
+    # Problems found while loading, logged once logging is set up
+    warnings: List[str] = field(default_factory=list)
+
+
+def is_placeholder(value: str) -> bool:
+    """Detect values copied unchanged from the .sample files."""
+    lowered = value.lower()
+    return "your_" in lowered or "your-" in lowered or "example.com" in lowered
+
+
+def clean_value(value) -> Optional[str]:
+    """Return the stripped string, or None for empty values and sample placeholders."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or is_placeholder(text):
+        return None
     return text
 
-def sanitize_telegram_output(text: str, token: str = None) -> str:
-    """
-    Remove credentials and sensitive information from Telegram log output.
-    Masks Telegram bot tokens and other sensitive patterns.
-    """
-    if not text:
-        return text
-    
-    # Mask Telegram bot token if provided
-    if token:
-        text = text.replace(token, token[:6] + '...' + token[-6:] if len(token) > 12 else '***')
-    
-    # Mask common token patterns
-    token_pattern = r'\b([A-Za-z0-9_-]{20,})\b'
-    def mask_token(match):
-        token_str = match.group(1)
-        if len(token_str) < 20:
-            return token_str
-        return token_str[:6] + '...' + token_str[-6:]
-    
-    text = re.sub(token_pattern, mask_token, text)
-    
-    # Mask common credential patterns in JSON/text responses
-    credential_patterns = [
-        (r'bot[_-]?token["\']?\s*[:=]\s*["\']?([A-Za-z0-9_-]{10,})["\']?', r'bot_token="***"'),
-        (r'api[_-]?token["\']?\s*[:=]\s*["\']?([A-Za-z0-9_-]{10,})["\']?', r'api_token="***"'),
-        (r'password["\']?\s*[:=]\s*["\']?([^\s"\']+)["\']?', r'password="***"'),
-        (r'secret["\']?\s*[:=]\s*["\']?([A-Za-z0-9_-]{10,})["\']?', r'secret="***"'),
-    ]
-    
-    for pattern, replacement in credential_patterns:
-        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
-    
-    return text
 
-def create_notification_data(script_name: str, server_name: str, server_id: str, status: str, 
-                             hostname: str, timestamp: str, snapshot_name: str, total_snapshots: int,
-                             provider: str = "unknown") -> dict:
-    """
-    Create a standardized notification data structure used by both Telegram and webhook.
-    Returns a dictionary with all notification data.
-    """
-    return {
-        "script": script_name,
-        "provider": provider,
-        "server": server_name,
-        "server_id": server_id,
-        "status": status.upper(),
-        "hostname": hostname,
-        "timestamp": timestamp,
-        "snapshot_name": snapshot_name,
-        "total_snapshots": total_snapshots,
-        "snapshot_info": f"{total_snapshots} snapshots exist"
-    }
+def decode_newlines(text: str) -> Optional[str]:
+    """INI values cannot contain line breaks, so templates use a literal '\\n'."""
+    return text.replace("\\n", "\n") if text else None
 
-def format_telegram_message_from_data(data: dict) -> str:
-    """
-    Formats notification data into a Markdown message for Telegram.
-    Uses the same data structure as webhook payloads.
-    """
-    provider_label = data.get('provider', 'unknown').upper()
-    formatted_message = (
-        f"*FINAL_STATUS*\n"
-        f"*Script:* `{data['script']}`\n"
-        f"*Provider:* `{provider_label}`\n"
-        f"*Server:* `{data['server']}`\n"
-        f"*Status:* `{data['status']}`\n"
-        f"*Hostname:* `{data['hostname']}`\n"
-        f"*Timestamp:* `{data['timestamp']}`\n"
-        f"*Snapshot:* `{data['snapshot_name']}`\n"
-        f"*Total Snapshots:* `{data['snapshot_info']}`"
-    )
-    return formatted_message
 
-def format_telegram_message(raw_message: str) -> str:
-    """
-    Formats the raw FINAL_STATUS log entry into a Markdown message for Telegram.
-    This is a compatibility function that parses the log format and converts it.
-    """
-    parts = raw_message.split(" | ")
-    if len(parts) != 9:  # Updated to include provider
-        return raw_message  # Return as is if format is unexpected
+def _delivery(section: configparser.SectionProxy) -> Delivery:
+    return Delivery(timeout=section.getfloat("timeout"),
+                    retries=max(1, section.getint("retries")),
+                    base_delay=section.getfloat("base_delay_between_retries"))
 
-    _, script_name, provider, server_name, status, hostname, timestamp, snapshot_name, snapshot_info = parts
-    
-    # Extract server_id from snapshot_info if possible, otherwise use server_name
-    server_id = server_name  # Default fallback
-    
-    # Parse total_snapshots from snapshot_info (e.g., "3 snapshots exist" -> 3)
-    total_snapshots = 0
+
+def _json_template(section: configparser.SectionProxy, key: str, warnings: List[str]) -> Optional[dict]:
+    raw = section.get(key, "").strip()
+    if not raw:
+        return None
     try:
-        match = re.search(r'(\d+)\s+snapshots', snapshot_info)
-        if match:
-            total_snapshots = int(match.group(1))
-    except:
-        pass
-    
-    data = create_notification_data(
-        script_name, server_name, server_id, status,
-        hostname, timestamp, snapshot_name, total_snapshots, provider
-    )
-    return format_telegram_message_from_data(data)
+        value = json.loads(raw)
+    except json.JSONDecodeError as e:
+        warnings.append(f"[{section.name}] {key} is not valid JSON ({e}), using default payload")
+        return None
+    if not isinstance(value, dict):
+        warnings.append(f"[{section.name}] {key} must be a JSON object, using default payload")
+        return None
+    return value
 
-def send_telegram_notification(data: dict, logger: logging.Logger, 
-                              bot_token: Optional[str] = None, 
-                              chat_id: Optional[str] = None,
-                              custom_message: Optional[str] = None,
-                              retries: int = None,
-                              base_delay: int = None) -> bool:
-    """
-    Send a Telegram notification using standardized notification data.
-    Uses per-server credentials if provided, otherwise falls back to global config.
-    Implements exponential backoff for retries.
-    Returns True if successful, False otherwise.
-    """
-    # Use per-server credentials if provided, otherwise use global config
-    token = bot_token if bot_token else TELEGRAM_BOT_TOKEN
-    chat = chat_id if chat_id else TELEGRAM_CHAT_ID
-    
-    if not token or not chat:
-        logger.debug("Telegram notifications skipped: missing bot_token or chat_id")
-        return False
-    
-    # Use provided retries/delay or fall back to global config
-    max_retries = retries if retries is not None else TELEGRAM_RETRIES
-    base_delay_seconds = base_delay if base_delay is not None else TELEGRAM_BASE_DELAY_BETWEEN_RETRIES
-    
-    api_url = f"https://api.telegram.org/bot{token}/sendMessage"
-    
-    # Use custom message if provided, otherwise format from standardized data
-    if custom_message:
-        formatted_message = custom_message
-    else:
-        formatted_message = format_telegram_message_from_data(data)
-    
-    for attempt in range(1, max_retries + 1):
-        try:
-            payload = {
-                "chat_id": chat,
-                "text": formatted_message,
-                "parse_mode": "Markdown"
-            }
-            response = requests.post(api_url, data=payload, timeout=TELEGRAM_TIMEOUT)
-            
-            if response.status_code == 200:
-                logger.debug("Telegram notification sent successfully")
-                return True
-            else:
-                sanitized_response = sanitize_telegram_output(response.text, token)
-                logger.warning(f"Telegram API error: {response.status_code} - {sanitized_response}")
-                
-        except requests.exceptions.RequestException as e:
-            error_msg = sanitize_telegram_output(str(e), token)
-            logger.warning(f"Telegram notification failed: {error_msg}")
-        
-        if attempt < max_retries:
-            # Exponential backoff: delay = base_delay * (2 ^ (attempt - 1))
-            delay_seconds = base_delay_seconds * (2 ** (attempt - 1))
-            logger.debug(f"Retrying Telegram notification in {delay_seconds}s (attempt {attempt}/{max_retries}, exponential backoff)")
-            time.sleep(delay_seconds)
-    
-    logger.warning(f"Failed to send Telegram notification after {max_retries} attempts")
-    return False
 
-def send_webhook_notification(logger: logging.Logger,
-                              webhook_url: str,
-                              payload: dict,
-                              timeout: int = None,
-                              retries: int = None,
-                              base_delay: int = None) -> bool:
-    """
-    Send a webhook notification with JSON payload.
-    Compatible with n8n webhook nodes and other standard webhook receivers.
-    Implements exponential backoff for retries.
-    Returns True if successful, False otherwise.
-    
-    The payload is sent as JSON in the request body with Content-Type: application/json header.
-    n8n webhook nodes will receive this data in the $json context variable.
-    """
-    if not webhook_url:
-        logger.debug("Webhook notification skipped: no URL provided")
-        return False
-    
-    # Use provided values or fall back to global config
-    timeout_seconds = timeout if timeout is not None else WEBHOOK_TIMEOUT
-    max_retries = retries if retries is not None else WEBHOOK_RETRIES
-    base_delay_seconds = base_delay if base_delay is not None else WEBHOOK_BASE_DELAY_BETWEEN_RETRIES
-    
-    # Sanitize URL for logging (remove potential tokens/credentials)
-    sanitized_url = sanitize_log_output(webhook_url)
-    logger.debug(f"[WEBHOOK] Preparing notification to: {sanitized_url}")
-    logger.debug(f"[WEBHOOK] Payload size: {len(json.dumps(payload))} bytes")
-    logger.debug(f"[WEBHOOK] Payload keys: {list(payload.keys())}")
-    
-    for attempt in range(1, max_retries + 1):
-        logger.debug(f"[WEBHOOK] Attempt {attempt}/{max_retries} - Sending notification")
-        start_time = time.time()
-        
-        try:
-            logger.debug(f"[WEBHOOK] POST request to webhook (timeout: {timeout_seconds}s)")
-            # Ensure proper headers for n8n compatibility
-            headers = {
-                'Content-Type': 'application/json',
-                'Accept': 'application/json'
-            }
-            response = requests.post(webhook_url, json=payload, headers=headers, timeout=timeout_seconds)
-            request_time = time.time() - start_time
-            
-            logger.debug(f"[WEBHOOK] Response received in {request_time:.2f}s (status: {response.status_code})")
-            
-            if response.status_code >= 200 and response.status_code < 300:
-                logger.debug(f"Webhook notification sent successfully (status: {response.status_code})")
-                sanitized_response = sanitize_log_output(response.text[:200])
-                logger.debug(f"[WEBHOOK] Response body (first 200 chars): {sanitized_response}")
-                return True
-            else:
-                sanitized_response = sanitize_log_output(response.text[:200])
-                logger.warning(f"Webhook API error: {response.status_code} - {sanitized_response}")
-                
-        except requests.exceptions.Timeout as e:
-            request_time = time.time() - start_time
-            error_msg = sanitize_log_output(str(e))
-            logger.warning(f"Webhook notification timeout after {request_time:.2f}s: {error_msg}")
-        except requests.exceptions.RequestException as e:
-            request_time = time.time() - start_time
-            error_msg = sanitize_log_output(str(e))
-            logger.warning(f"Webhook notification failed after {request_time:.2f}s: {error_msg}")
-        
-        if attempt < max_retries:
-            # Exponential backoff: delay = base_delay * (2 ^ (attempt - 1))
-            delay_seconds = base_delay_seconds * (2 ** (attempt - 1))
-            logger.debug(f"Retrying webhook notification in {delay_seconds}s (attempt {attempt}/{max_retries}, exponential backoff)")
-            time.sleep(delay_seconds)
-    
-    logger.warning(f"Failed to send webhook notification after {max_retries} attempts")
-    return False
+def load_settings(path: str = CONFIG_FILE) -> Settings:
+    """Load snapshots.config on top of the defaults. Relative paths are relative to the project directory."""
+    parser = configparser.ConfigParser(interpolation=None)
+    parser.read_dict(DEFAULT_SETTINGS)
+    try:
+        parser.read(path, encoding="utf-8")
+    except configparser.Error as e:
+        raise ConfigError(f"Cannot parse '{path}': {e}") from e
+
+    def project_path(*parts: str) -> str:
+        return os.path.join(PROJECT_DIR, *parts)
+
+    try:
+        logs_dir = project_path(parser.get("DIRECTORIES", "logs_dir"))
+        warnings: List[str] = []
+        level_name = parser.get("LOGGING", "level").upper()
+        log_level = logging.getLevelName(level_name)
+        if not isinstance(log_level, int):
+            warnings.append(f"[LOGGING] unknown level '{level_name}', using INFO")
+            log_level = logging.INFO
+
+        tg = parser["TELEGRAM"]
+        wh = parser["WEBHOOK"]
+        hb = parser["HEARTBEAT"]
+        settings = Settings(
+            configs_dir=project_path(parser.get("DIRECTORIES", "configs_dir")),
+            log_file=os.path.join(logs_dir, parser.get("FILES", "log_file")),
+            lock_file=os.path.join(logs_dir, parser.get("FILES", "lock_file")),
+            delay_between_servers=parser.getfloat("TIMING", "delay_between_servers"),
+            snapshot_creation_timeout=parser.getfloat("TIMING", "snapshot_creation_timeout"),
+            action_poll_interval=parser.getfloat("TIMING", "action_poll_interval"),
+            log_to_file=parser.getboolean("LOGGING", "file_enabled"),
+            log_level=log_level,
+            log_max_bytes=parser.getint("LOGGING", "max_bytes"),
+            log_backup_count=parser.getint("LOGGING", "backup_count"),
+            telegram=TelegramSettings(
+                enabled=tg.getboolean("enabled"),
+                bot_token=clean_value(tg.get("bot_token")),
+                chat_id=clean_value(tg.get("chat_id")),
+                message_success=decode_newlines(tg.get("message_success", "").strip()),
+                message_failure=decode_newlines(tg.get("message_failure", "").strip()),
+                delivery=_delivery(tg),
+            ),
+            webhook=WebhookSettings(
+                enabled=wh.getboolean("enabled"),
+                url=clean_value(wh.get("url")),
+                payload_success=_json_template(wh, "payload_success", warnings),
+                payload_failure=_json_template(wh, "payload_failure", warnings),
+                delivery=_delivery(wh),
+            ),
+            heartbeat=HeartbeatSettings(
+                enabled=hb.getboolean("enabled"),
+                url=clean_value(hb.get("url")),
+                delivery=_delivery(hb),
+            ),
+            warnings=warnings,
+        )
+    except ValueError as e:
+        raise ConfigError(f"Invalid value in '{path}': {e}") from e
+
+    if settings.heartbeat.enabled and not settings.heartbeat.url:
+        settings.warnings.append("[HEARTBEAT] enabled but no url configured, heartbeat disabled")
+        settings.heartbeat.enabled = False
+
+    for secret in (settings.telegram.bot_token, settings.webhook.url, settings.heartbeat.url):
+        REDACTOR.add(secret)
+    return settings
+
+
+# ============================================================================
+# Server configuration (configs/*.json)
+# ============================================================================
+
+@dataclass
+class TelegramTarget:
+    bot_token: str
+    chat_id: str
+    message_success: Optional[str] = None
+    message_failure: Optional[str] = None
+
+
+@dataclass
+class WebhookTarget:
+    url: str
+    payload_success: Optional[dict] = None
+    payload_failure: Optional[dict] = None
+
 
 @dataclass
 class ServerConfig:
@@ -421,1247 +318,720 @@ class ServerConfig:
     name: str
     api_token: str
     retain_last_snapshots: int
-    # Telegram settings (optional - if not set, Telegram notifications are skipped for this server)
-    telegram_enabled: bool = False
-    telegram_bot_token: Optional[str] = None
-    telegram_chat_id: Optional[str] = None
-    telegram_message_success: Optional[str] = None  # Custom message template for success
-    telegram_message_failure: Optional[str] = None  # Custom message template for failure
-    # Webhook settings (optional - if not set, webhook notifications are skipped for this server)
-    webhook_enabled: bool = False
-    webhook_url: Optional[str] = None
-    webhook_payload_success: Optional[dict] = None  # Custom JSON payload for success
-    webhook_payload_failure: Optional[dict] = None  # Custom JSON payload for failure
+    telegram: Optional[TelegramTarget] = None
+    webhook: Optional[WebhookTarget] = None
+    heartbeat_url: Optional[str] = None
+
+
+def _block(data: dict, key: str) -> dict:
+    value = data.get(key)
+    return value if isinstance(value, dict) else {}
+
+
+def channel_enabled(block: dict, global_enabled: bool, has_credentials: bool, channel: str, server_name: str) -> bool:
+    """
+    'enabled' in the server JSON wins; without it the global flag from snapshots.config applies.
+    Credentials come from the server JSON, with snapshots.config as fallback.
+    """
+    explicit = block.get("enabled")
+    if explicit is False or (explicit is None and not global_enabled):
+        return False
+    if not has_credentials:
+        if explicit is True:
+            logger.error(f"{channel} enabled for '{server_name}' but no credentials in JSON or snapshots.config - skipped")
+        return False
+    return True
+
+
+def parse_server_config(path: str, settings: Settings) -> ServerConfig:
+    """Read and validate one server JSON file. Raises ConfigError with a readable reason."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise ConfigError(f"cannot read file: {e}") from e
+    if not isinstance(raw, dict):
+        raise ConfigError("file does not contain a JSON object")
+
+    keys = [key for key in CONFIG_KEYS if key in raw]
+    if len(keys) != 1:
+        raise ConfigError(f"must contain exactly one of: {', '.join(CONFIG_KEYS)}")
+    provider = CONFIG_KEYS[keys[0]]
+    data = raw[keys[0]]
+    if not isinstance(data, dict):
+        raise ConfigError(f"'{keys[0]}' must be a JSON object")
+
+    declared = str(data.get("provider") or provider).strip().lower()
+    if declared != provider:
+        raise ConfigError(f"provider '{declared}' does not match key '{keys[0]}'")
+
+    missing = [key for key in ("id", "name", "api_token", "retain_last_snapshots") if data.get(key) in (None, "")]
+    if missing:
+        raise ConfigError(f"missing required field(s): {', '.join(missing)}")
+
+    api_token = clean_value(data["api_token"])
+    if not api_token:
+        raise ConfigError("api_token is empty or still the sample placeholder")
+    server_id = clean_value(data["id"])
+    if not server_id:
+        raise ConfigError("id is still the sample placeholder")
+    try:
+        retain = int(data["retain_last_snapshots"])
+    except (TypeError, ValueError):
+        raise ConfigError("retain_last_snapshots must be an integer")
+    if retain < 0:
+        raise ConfigError("retain_last_snapshots must not be negative")
+    name = str(data["name"]).strip()
+    REDACTOR.add(api_token)
+
+    tg = _block(data, "telegram")
+    bot_token = clean_value(tg.get("bot_token")) or settings.telegram.bot_token
+    chat_id = clean_value(tg.get("chat_id")) or settings.telegram.chat_id
+    telegram = None
+    if channel_enabled(tg, settings.telegram.enabled, bool(bot_token and chat_id), "Telegram", name):
+        REDACTOR.add(bot_token)
+        telegram = TelegramTarget(
+            bot_token=bot_token,
+            chat_id=chat_id,
+            message_success=tg.get("message_success") or settings.telegram.message_success,
+            message_failure=tg.get("message_failure") or settings.telegram.message_failure,
+        )
+
+    wh = _block(data, "webhook")
+    webhook_url = clean_value(wh.get("url")) or settings.webhook.url
+    webhook = None
+    if channel_enabled(wh, settings.webhook.enabled, bool(webhook_url), "Webhook", name):
+        REDACTOR.add(webhook_url)
+        webhook = WebhookTarget(
+            url=webhook_url,
+            payload_success=_block(wh, "payload_success") or settings.webhook.payload_success,
+            payload_failure=_block(wh, "payload_failure") or settings.webhook.payload_failure,
+        )
+
+    # Per-server heartbeat has no global fallback: the global heartbeat reports the whole run
+    hb = _block(data, "heartbeat")
+    heartbeat_url = clean_value(hb.get("url")) if hb.get("enabled", True) is not False else None
+    REDACTOR.add(heartbeat_url)
+
+    return ServerConfig(provider=provider, id=server_id, name=name, api_token=api_token,
+                        retain_last_snapshots=retain, telegram=telegram, webhook=webhook,
+                        heartbeat_url=heartbeat_url)
+
+
+def config_files(configs_dir: str, names: Optional[List[str]] = None) -> List[str]:
+    """Server config paths: the given names, or all *.json files in configs_dir (macOS '._*' files skipped)."""
+    if not names:
+        names = sorted(f for f in os.listdir(configs_dir) if f.lower().endswith(".json") and not f.startswith("._"))
+    return [os.path.join(configs_dir, name) for name in names]
+
+
+def warn_if_readable_by_others(paths: List[str]):
+    exposed = [os.path.basename(p) for p in paths if os.path.exists(p) and os.stat(p).st_mode & 0o077]
+    if exposed:
+        logger.warning(f"Files with credentials are readable by other users, run 'chmod 600' on: {', '.join(exposed)}")
+
+
+def load_servers(settings: Settings, names: Optional[List[str]] = None) -> List[ServerConfig]:
+    """Load all valid server configs. Invalid files are logged and skipped."""
+    servers: List[ServerConfig] = []
+    seen = set()
+    paths = config_files(settings.configs_dir, names)
+    warn_if_readable_by_others([CONFIG_FILE] + paths)
+    for path in paths:
+        try:
+            server = parse_server_config(path, settings)
+        except ConfigError as e:
+            logger.error(f"Skipping '{os.path.basename(path)}': {e}")
+            continue
+        key = (server.provider, server.id)
+        if key in seen:
+            logger.error(f"Skipping '{os.path.basename(path)}': {server.provider} server ID {server.id} is configured twice")
+            continue
+        seen.add(key)
+        servers.append(server)
+    return servers
+
+
+# ============================================================================
+# Cloud providers
+# ============================================================================
+
+@dataclass
+class Snapshot:
+    id: str
+    name: str
+    created_at: datetime.datetime
+    owner_id: str  # ID of the server the snapshot was taken from
+
+
+def snapshot_name_for(server: ServerConfig, now: Optional[datetime.datetime] = None) -> str:
+    return f"{server.name}-{(now or datetime.datetime.now()).strftime('%Y%m%d%H%M%S')}"
+
+
+def is_managed_name(server: ServerConfig, snapshot_name: str) -> bool:
+    """Only '<server.name>-<YYYYmmddHHMMSS>' snapshots are managed, so manual snapshots are never touched."""
+    return re.fullmatch(re.escape(server.name) + r"-\d{14}", snapshot_name or "") is not None
+
+
+def select_for_deletion(snapshots: List[Snapshot], retain: int) -> List[Snapshot]:
+    """Keep the newest `retain` snapshots (in addition to the one just created), return the rest."""
+    return sorted(snapshots, key=lambda s: s.created_at, reverse=True)[retain:]
+
+
+def parse_timestamp(value: str) -> datetime.datetime:
+    return datetime.datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(datetime.timezone.utc)
+
+
+def build_session(api_token: str) -> requests.Session:
+    """
+    HTTP session with retries for transient errors (connection problems, 429, 5xx).
+    POST is only retried on connection errors, so a snapshot is never requested twice.
+    """
+    retry = Retry(total=5, connect=5, read=2, status=4, backoff_factor=2,
+                  status_forcelist=(429, 500, 502, 503, 504),
+                  allowed_methods=frozenset({"GET", "DELETE"}),
+                  respect_retry_after_header=True, raise_on_status=False)
+    session = requests.Session()
+    session.headers.update({
+        "Authorization": f"Bearer {api_token}",
+        "Content-Type": "application/json",
+        "User-Agent": f"{SCRIPT_NAME}/{__version__}",
+    })
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+    return session
+
+
+class CloudProvider:
+    """Common API flow; subclasses describe the provider-specific endpoints and fields."""
+
+    label = ""
+    base_url = ""
+    list_path = ""
+    list_params: Dict[str, object] = {}
+    list_key = ""
+    action_done = ""
+    action_failed = ""
+
+    def __init__(self, server: ServerConfig, session: Optional[requests.Session] = None):
+        self.server = server
+        self.session = session or build_session(server.api_token)
+
+    # Provider-specific parts
+    def _parse_snapshot(self, item: dict) -> Snapshot:
+        raise NotImplementedError
+
+    def _has_next_page(self, data: dict) -> bool:
+        raise NotImplementedError
+
+    def _create_request(self, name: str):
+        raise NotImplementedError
+
+    def _delete_path(self, snapshot_id: str) -> str:
+        raise NotImplementedError
+
+    # Common flow
+    def _request(self, method: str, path: str, **kwargs) -> dict:
+        try:
+            response = self.session.request(method, self.base_url + path, timeout=API_REQUEST_TIMEOUT, **kwargs)
+        except requests.RequestException as e:
+            raise ProviderError(f"{self.label} {method} {path} failed: {e}") from e
+        if not 200 <= response.status_code < 300:
+            raise ProviderError(f"{self.label} {method} {path} returned HTTP {response.status_code}: {response.text[:200]}",
+                                status_code=response.status_code)
+        try:
+            return response.json() if response.content else {}
+        except ValueError as e:
+            raise ProviderError(f"{self.label} {method} {path} returned invalid JSON") from e
+
+    def list_snapshots(self) -> List[Snapshot]:
+        """All snapshots of this server that were created by this script."""
+        snapshots: List[Snapshot] = []
+        page = 1
+        while True:
+            data = self._request("GET", self.list_path, params={**self.list_params, "page": page})
+            for item in data.get(self.list_key) or []:
+                try:
+                    snapshot = self._parse_snapshot(item)
+                except (KeyError, TypeError, ValueError):
+                    logger.warning(f"Ignoring {self.label} snapshot with unexpected format (ID: {item.get('id')})")
+                    continue
+                if snapshot.owner_id == str(self.server.id) and is_managed_name(self.server, snapshot.name):
+                    snapshots.append(snapshot)
+            if not self._has_next_page(data):
+                return snapshots
+            page += 1
+
+    def create_snapshot(self, name: str) -> str:
+        """Start the snapshot and return the action ID to poll."""
+        path, payload = self._create_request(name)
+        data = self._request("POST", path, json=payload)
+        action_id = (data.get("action") or {}).get("id")
+        if not action_id:
+            raise ProviderError(f"{self.label} did not return an action ID for the snapshot")
+        return str(action_id)
+
+    def wait_for_action(self, action_id: str, timeout: float, poll_interval: float) -> str:
+        """Returns 'done', 'failed' or 'timeout'. Client errors (e.g. 401) abort immediately."""
+        deadline = time.monotonic() + timeout
+        while True:
+            status = None
+            try:
+                status = (self._request("GET", f"/actions/{action_id}").get("action") or {}).get("status")
+            except ProviderError as e:
+                if e.status_code and 400 <= e.status_code < 500 and e.status_code != 429:
+                    raise
+                logger.warning(f"Checking snapshot progress failed, will retry: {e}")
+            if status == self.action_done:
+                return "done"
+            if status == self.action_failed:
+                return "failed"
+            if time.monotonic() >= deadline:
+                return "timeout"
+            time.sleep(poll_interval)
+
+    def delete_snapshot(self, snapshot: Snapshot) -> bool:
+        try:
+            self._request("DELETE", self._delete_path(snapshot.id))
+        except ProviderError as e:
+            if e.status_code == 404:
+                logger.warning(f"Snapshot {snapshot.name} was already deleted")
+                return True
+            logger.error(f"Deleting snapshot {snapshot.name} failed: {e}")
+            return False
+        logger.info(f"Deleted snapshot {snapshot.name} (ID: {snapshot.id})")
+        return True
+
+
+class DigitalOceanProvider(CloudProvider):
+    label = "DigitalOcean"
+    base_url = "https://api.digitalocean.com/v2"
+    list_path = "/snapshots"
+    list_params = {"resource_type": "droplet", "per_page": 200}
+    list_key = "snapshots"
+    action_done = "completed"
+    action_failed = "errored"
+
+    def _parse_snapshot(self, item: dict) -> Snapshot:
+        return Snapshot(id=str(item["id"]), name=item.get("name") or "",
+                        created_at=parse_timestamp(item["created_at"]), owner_id=str(item.get("resource_id")))
+
+    def _has_next_page(self, data: dict) -> bool:
+        return bool(((data.get("links") or {}).get("pages") or {}).get("next"))
+
+    def _create_request(self, name: str):
+        return f"/droplets/{self.server.id}/actions", {"type": "snapshot", "name": name}
+
+    def _delete_path(self, snapshot_id: str) -> str:
+        return f"/snapshots/{snapshot_id}"
+
+
+class HetznerProvider(CloudProvider):
+    label = "Hetzner"
+    base_url = "https://api.hetzner.cloud/v1"
+    list_path = "/images"
+    list_params = {"type": "snapshot", "per_page": 50}
+    list_key = "images"
+    action_done = "success"
+    action_failed = "error"
+
+    def _parse_snapshot(self, item: dict) -> Snapshot:
+        return Snapshot(id=str(item["id"]), name=item.get("description") or "",
+                        created_at=parse_timestamp(item["created"]),
+                        owner_id=str((item.get("created_from") or {}).get("id")))
+
+    def _has_next_page(self, data: dict) -> bool:
+        return bool(((data.get("meta") or {}).get("pagination") or {}).get("next_page"))
+
+    def _create_request(self, name: str):
+        return f"/servers/{self.server.id}/actions/create_image", {"type": "snapshot", "description": name}
+
+    def _delete_path(self, snapshot_id: str) -> str:
+        return f"/images/{snapshot_id}"
+
+
+PROVIDERS = {"digitalocean": DigitalOceanProvider, "hetzner": HetznerProvider}
+
+
+# ============================================================================
+# Notifications (Telegram, webhook, heartbeat)
+# ============================================================================
+
+@dataclass
+class ServerResult:
+    server: ServerConfig
+    success: bool
+    snapshot_name: Optional[str] = None
+    total_snapshots: Optional[int] = None
+    deleted: int = 0
+    error: Optional[str] = None
+
+
+def notification_context(result: ServerResult, hostname: str, timestamp: str) -> Dict[str, str]:
+    """Values for the {placeholders} in Telegram messages and webhook payloads."""
+    server = result.server
+    total = "unknown" if result.total_snapshots is None else str(result.total_snapshots)
+    return {
+        "script": SCRIPT_NAME,
+        "provider": server.provider,
+        "server_name": server.name,
+        "server_id": server.id,
+        "droplet_name": server.name,  # backward compatibility
+        "droplet_id": server.id,  # backward compatibility
+        "snapshot_name": result.snapshot_name or "none",
+        "total_snapshots": total,
+        "snapshot_info": f"{total} snapshots exist",
+        "status": "SUCCESS" if result.success else "FAILURE",
+        "hostname": hostname,
+        "timestamp": timestamp,
+        "error": REDACTOR.redact(result.error),
+    }
+
+
+def render_template(template, context: Dict[str, str]):
+    """Replace {placeholders} in strings, recursively inside dicts and lists."""
+    if isinstance(template, str):
+        for key, value in context.items():
+            template = template.replace("{" + key + "}", value)
+        return template
+    if isinstance(template, dict):
+        return {key: render_template(value, context) for key, value in template.items()}
+    if isinstance(template, list):
+        return [render_template(value, context) for value in template]
+    return template
+
+
+def default_telegram_message(context: Dict[str, str]) -> str:
+    lines = [
+        f"*{context['status']}* snapshot `{context['server_name']}`",
+        f"Provider: `{context['provider'].upper()}`",
+        f"Snapshot: `{context['snapshot_name']}`",
+        f"Total: `{context['snapshot_info']}`",
+        f"Host: `{context['hostname']}` at `{context['timestamp']}`",
+    ]
+    if context["error"]:
+        lines.append(f"Error: `{context['error']}`")
+    return "\n".join(lines)
+
+
+def default_webhook_payload(result: ServerResult, context: Dict[str, str]) -> dict:
+    return {
+        "script": context["script"],
+        "provider": context["provider"],
+        "server": context["server_name"],
+        "server_id": context["server_id"],
+        "status": context["status"],
+        "hostname": context["hostname"],
+        "timestamp": context["timestamp"],
+        "snapshot_name": context["snapshot_name"],
+        "total_snapshots": result.total_snapshots,
+        "snapshot_info": context["snapshot_info"],
+        "error": context["error"] or None,
+    }
+
+
+def heartbeat_url(base_url: str, up: bool, message: str) -> str:
+    """
+    Uptime Kuma push URL with status and message. Any status/msg/ping parameters copied along
+    with the push URL from Uptime Kuma are replaced.
+    """
+    parts = urlsplit(base_url)
+    query = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if k not in ("status", "msg", "ping")]
+    query += [("status", "up" if up else "down"), ("msg", message[:HEARTBEAT_MESSAGE_LIMIT])]
+    return urlunsplit(parts._replace(query=urlencode(query)))
+
+
+def deliver(label: str, send: Callable[[], requests.Response], delivery: Delivery) -> bool:
+    """Call `send` until it returns a 2xx response, with exponential backoff. Client errors are not retried."""
+    for attempt in range(1, delivery.retries + 1):
+        try:
+            response = send()
+            if 200 <= response.status_code < 300:
+                logger.debug(f"{label} sent")
+                return True
+            logger.warning(f"{label} failed: HTTP {response.status_code} - {response.text[:200]}")
+            if 400 <= response.status_code < 500 and response.status_code != 429:
+                break
+        except requests.RequestException as e:
+            logger.warning(f"{label} failed: {e}")
+        if attempt < delivery.retries:
+            time.sleep(delivery.base_delay * 2 ** (attempt - 1))
+    logger.warning(f"{label} not delivered")
+    return False
+
+
+class Notifier:
+    def __init__(self, settings: Settings, http: Optional[requests.Session] = None):
+        self.settings = settings
+        self.http = http or requests.Session()
+        self.hostname = socket.gethostname()
+
+    def server_finished(self, result: ServerResult):
+        """Telegram, webhook and per-server heartbeat. Never raises."""
+        try:
+            context = notification_context(result, self.hostname, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            server = result.server
+            if server.telegram:
+                template = server.telegram.message_success if result.success else server.telegram.message_failure
+                text = render_template(template, context) if template else default_telegram_message(context)
+                self.send_telegram(server.telegram, text)
+            if server.webhook:
+                template = server.webhook.payload_success if result.success else server.webhook.payload_failure
+                payload = render_template(template, context) if template else default_webhook_payload(result, context)
+                self.send_webhook(server.webhook.url, payload)
+            if server.heartbeat_url:
+                if result.success:
+                    message = f"OK: {result.snapshot_name}, {context['snapshot_info']}"
+                else:
+                    message = f"FAILED: {context['error'] or 'snapshot not created'}"
+                self.send_heartbeat(server.heartbeat_url, result.success, message, f"Heartbeat for '{server.name}'")
+        except Exception:
+            logger.exception(f"Sending notifications for '{result.server.name}' failed")
+
+    def run_finished(self, up: bool, message: str):
+        """Global heartbeat for the whole run. Never raises."""
+        hb = self.settings.heartbeat
+        if not hb.enabled:
+            return
+        try:
+            self.send_heartbeat(hb.url, up, message, "Heartbeat")
+        except Exception:
+            logger.exception("Sending heartbeat failed")
+
+    def send_telegram(self, target: TelegramTarget, text: str) -> bool:
+        url = f"{TELEGRAM_API_URL}/bot{target.bot_token}/sendMessage"
+        delivery = self.settings.telegram.delivery
+
+        def send():
+            response = self.http.post(url, data={"chat_id": target.chat_id, "text": text, "parse_mode": "Markdown"},
+                                      timeout=delivery.timeout)
+            # Values such as server names with '_' can break Markdown, plain text still gets the message through
+            if response.status_code == 400 and "parse" in response.text.lower():
+                logger.warning("Telegram rejected the Markdown formatting, sending as plain text")
+                response = self.http.post(url, data={"chat_id": target.chat_id, "text": text}, timeout=delivery.timeout)
+            return response
+
+        return deliver("Telegram notification", send, delivery)
+
+    def send_webhook(self, url: str, payload: dict) -> bool:
+        delivery = self.settings.webhook.delivery
+        return deliver("Webhook notification",
+                       lambda: self.http.post(url, json=payload, headers={"Accept": "application/json"},
+                                              timeout=delivery.timeout),
+                       delivery)
+
+    def send_heartbeat(self, base_url: str, up: bool, message: str, label: str) -> bool:
+        delivery = self.settings.heartbeat.delivery
+        message = REDACTOR.redact(message)
+        logger.info(f"{label}: {'up' if up else 'down'} - {message}")
+        return deliver(label, lambda: self.http.get(heartbeat_url(base_url, up, message), timeout=delivery.timeout),
+                       delivery)
+
+
+# ============================================================================
+# Snapshot management
+# ============================================================================
 
 class SnapshotManager:
-    def __init__(self, config_paths: List[str], verbose: bool = False):
-        self.config_paths = config_paths
-        self.verbose = verbose
-        self.ensure_directories()
-        self.setup_logging()
-        
-        # Log initialization
-        self.logger.info("=" * 80)
-        self.logger.info("Initializing SnapshotManager")
-        self.logger.info(f"Configuration files: {', '.join(config_paths) if config_paths else 'All .json files'}")
-        self.logger.info(f"Verbose mode: {verbose}")
-        self.logger.debug(f"Log file: {LOG_FILE}")
-        self.logger.debug(f"Lock file: {LOCK_FILE}")
-        
-        self.servers = self.load_configs()
-        if not self.servers:
-            self.logger.warning("No valid server configurations found. Exiting.")
-            sys.exit(0)
-        
-        self.logger.info(f"Successfully loaded {len(self.servers)} server configuration(s)")
-        providers = {server.provider for server in self.servers}
-        self.logger.debug(f"Configured providers: {', '.join(providers)}")
-        
-        # Using direct API calls - no CLI tools required
-        self.logger.debug("Using direct API calls for cloud provider interactions")
+    def __init__(self, settings: Settings, servers: List[ServerConfig], notifier: Notifier,
+                 provider_factory: Optional[Callable[[ServerConfig], CloudProvider]] = None):
+        self.settings = settings
+        self.servers = servers
+        self.notifier = notifier
+        self.provider_factory = provider_factory or (lambda server: PROVIDERS[server.provider](server))
 
-    def ensure_directories(self):
-        """Ensure required directories exist."""
-        for directory in [LOGS_DIR, CONFIGS_DIR]:
-            if not os.path.exists(directory):
-                try:
-                    os.makedirs(directory, exist_ok=True)
-                except OSError as e:
-                    print(f"ERROR: Failed to create directory '{directory}': {e}", file=sys.stderr)
-                    sys.exit(1)
-
-    def load_configs(self) -> List[ServerConfig]:
-        """Load and validate JSON configuration files. Skip invalid files and log errors."""
-        servers = []
-        for path in self.config_paths:
-            full_path = os.path.join(CONFIGS_DIR, path)
-            
-            # Skip macOS resource fork files (._*)
-            if os.path.basename(path).startswith('._'):
-                if hasattr(self, 'logger'):
-                    self.logger.debug(f"Skipping macOS resource fork file: '{full_path}'")
-                continue
-            
-            # Skip non-JSON files
-            if not path.lower().endswith('.json'):
-                if hasattr(self, 'logger'):
-                    self.logger.warning(f"Skipping non-JSON file: '{full_path}'")
-                else:
-                    print(f"WARNING: Skipping non-JSON file: '{full_path}'", file=sys.stderr)
-                continue
-            
-            if not os.path.exists(full_path):
-                if hasattr(self, 'logger'):
-                    self.logger.error(f"Configuration file '{full_path}' does not exist. Skipping.")
-                else:
-                    print(f"ERROR: Configuration file '{full_path}' does not exist. Skipping.", file=sys.stderr)
-                continue
-            
-            # Validate JSON syntax and structure
-            try:
-                # Try to open with UTF-8 encoding, skip if encoding error
-                try:
-                    with open(full_path, 'r', encoding='utf-8') as f:
-                        config = json.load(f)
-                except UnicodeDecodeError as e:
-                    if hasattr(self, 'logger'):
-                        self.logger.warning(f"Configuration file '{full_path}' is not valid UTF-8 (likely binary file). Skipping.")
-                    else:
-                        print(f"WARNING: Configuration file '{full_path}' is not valid UTF-8. Skipping.", file=sys.stderr)
-                    continue
-                
-                # Check if JSON is valid but empty or None
-                if config is None:
-                    if hasattr(self, 'logger'):
-                        self.logger.error(f"Configuration file '{full_path}' is empty or null. Skipping.")
-                    else:
-                        print(f"ERROR: Configuration file '{full_path}' is empty or null. Skipping.", file=sys.stderr)
-                    continue
-                
-                # Validate structure
-                if not isinstance(config, dict):
-                    if hasattr(self, 'logger'):
-                        self.logger.error(f"Configuration file '{full_path}' does not contain a valid JSON object. Skipping.")
-                    else:
-                        print(f"ERROR: Configuration file '{full_path}' does not contain a valid JSON object. Skipping.", file=sys.stderr)
-                    continue
-                
-                # Detect provider type from JSON structure
-                server_data = None
-                provider = None
-                
-                if 'digitalocean_droplet' in config:
-                    server_data = config['digitalocean_droplet']
-                    provider = 'digitalocean'
-                elif 'hetzner_cloud_server' in config:
-                    server_data = config['hetzner_cloud_server']
-                    provider = 'hetzner'
-                else:
-                    if hasattr(self, 'logger'):
-                        self.logger.error(f"Configuration file '{full_path}' must contain either 'digitalocean_droplet' or 'hetzner_cloud_server' key. Skipping.")
-                    else:
-                        print(f"ERROR: Configuration file '{full_path}' must contain either 'digitalocean_droplet' or 'hetzner_cloud_server' key. Skipping.", file=sys.stderr)
-                    continue
-                
-                if not isinstance(server_data, dict):
-                    if hasattr(self, 'logger'):
-                        self.logger.error(f"Configuration file '{full_path}': server key does not contain a dictionary. Skipping.")
-                    else:
-                        print(f"ERROR: Configuration file '{full_path}': server key does not contain a dictionary. Skipping.", file=sys.stderr)
-                    continue
-                
-                # Validate provider field matches
-                config_provider = server_data.get('provider', '').lower()
-                if config_provider and config_provider != provider:
-                    if hasattr(self, 'logger'):
-                        self.logger.warning(f"Configuration file '{full_path}': provider field '{config_provider}' doesn't match key type '{provider}'. Using '{provider}'.")
-                    provider = config_provider  # Use the provider from the config
-                
-                # Validate required fields
-                required_fields = ['id', 'name', 'api_token', 'retain_last_snapshots']
-                missing_fields = [field for field in required_fields if field not in server_data]
-                if missing_fields:
-                    if hasattr(self, 'logger'):
-                        self.logger.error(f"Configuration file '{full_path}' is missing required field(s): {', '.join(missing_fields)}. Skipping.")
-                    else:
-                        print(f"ERROR: Configuration file '{full_path}' is missing required field(s): {', '.join(missing_fields)}. Skipping.", file=sys.stderr)
-                    continue
-                
-                # Extract optional Telegram settings
-                telegram_config = server_data.get('telegram', {})
-                # Check if telegram is explicitly configured in JSON
-                telegram_enabled_json = telegram_config.get('enabled', None) if isinstance(telegram_config, dict) else None
-                telegram_bot_token_raw = telegram_config.get('bot_token', '').strip() if isinstance(telegram_config, dict) else None
-                telegram_chat_id_raw = telegram_config.get('chat_id', '').strip() if isinstance(telegram_config, dict) else None
-                telegram_message_success = telegram_config.get('message_success') if isinstance(telegram_config, dict) else None
-                telegram_message_failure = telegram_config.get('message_failure') if isinstance(telegram_config, dict) else None
-                
-                # Check if credentials are missing or placeholder values
-                telegram_bot_token = None
-                telegram_chat_id = None
-                if telegram_bot_token_raw and telegram_bot_token_raw.lower() not in ['', 'your_telegram_bot_token_here', 'your_telegram_bot_token']:
-                    telegram_bot_token = telegram_bot_token_raw
-                if telegram_chat_id_raw and telegram_chat_id_raw.lower() not in ['', 'your_telegram_chat_id_here', 'your_telegram_chat_id']:
-                    telegram_chat_id = telegram_chat_id_raw
-                
-                # Determine if Telegram should be enabled
-                # If explicitly enabled in JSON, use it (with fallback credentials if needed)
-                # If not configured in JSON, use global enabled flag
-                if telegram_enabled_json is True:
-                    telegram_enabled = True
-                    # If Telegram is enabled in JSON but credentials are missing, use fallback from config
-                    if not telegram_bot_token or not telegram_chat_id:
-                        if hasattr(self, 'logger'):
-                            self.logger.debug(f"[CONFIG] Telegram enabled in JSON for '{server_data.get('name', 'unknown')}' but credentials missing, using fallback from snapshots.config")
-                        if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-                            telegram_bot_token = TELEGRAM_BOT_TOKEN
-                            telegram_chat_id = TELEGRAM_CHAT_ID
-                            if hasattr(self, 'logger'):
-                                self.logger.debug(f"[CONFIG] Using fallback Telegram credentials from snapshots.config")
-                        else:
-                            if hasattr(self, 'logger'):
-                                self.logger.error(f"[CONFIG] Telegram enabled in JSON for '{server_data.get('name', 'unknown')}' but no credentials found in JSON or fallback config. Telegram notifications will be skipped.")
-                            telegram_enabled = False  # Disable if no credentials available
-                elif telegram_enabled_json is False:
-                    # Explicitly disabled in JSON, don't use global fallback
-                    telegram_enabled = False
-                else:
-                    # Not configured in JSON, use global enabled flag
-                    telegram_enabled = TELEGRAM_ENABLED
-                    if telegram_enabled:
-                        # Use global credentials if per-server credentials are not available
-                        if not telegram_bot_token and TELEGRAM_BOT_TOKEN:
-                            telegram_bot_token = TELEGRAM_BOT_TOKEN
-                        if not telegram_chat_id and TELEGRAM_CHAT_ID:
-                            telegram_chat_id = TELEGRAM_CHAT_ID
-                        if hasattr(self, 'logger') and (telegram_bot_token or telegram_chat_id):
-                            self.logger.debug(f"[CONFIG] Using global Telegram settings for '{server_data.get('name', 'unknown')}'")
-                
-                # Extract optional webhook settings
-                webhook_config = server_data.get('webhook', {})
-                # Check if webhook is explicitly configured in JSON
-                webhook_enabled_json = webhook_config.get('enabled', None) if isinstance(webhook_config, dict) else None
-                webhook_url_raw = webhook_config.get('url', '').strip() if isinstance(webhook_config, dict) else None
-                webhook_payload_success = webhook_config.get('payload_success') if isinstance(webhook_config, dict) else None
-                webhook_payload_failure = webhook_config.get('payload_failure') if isinstance(webhook_config, dict) else None
-                
-                # Check if URL is missing or placeholder value
-                webhook_url = None
-                if webhook_url_raw and webhook_url_raw.lower() not in ['', 'https://your-webhook-url.com/notify', 'your-webhook-url.com', 'your_webhook_url_here']:
-                    webhook_url = webhook_url_raw
-                
-                # Determine if webhook should be enabled
-                # If explicitly enabled in JSON, use it (with fallback URL if needed)
-                # If not configured in JSON, use global enabled flag
-                if webhook_enabled_json is True:
-                    webhook_enabled = True
-                    # If webhook is enabled in JSON but URL is missing, use fallback from config
-                    if not webhook_url:
-                        if hasattr(self, 'logger'):
-                            self.logger.debug(f"[CONFIG] Webhook enabled in JSON for '{server_data.get('name', 'unknown')}' but URL missing, using fallback from snapshots.config")
-                        if WEBHOOK_URL:
-                            webhook_url = WEBHOOK_URL
-                            if hasattr(self, 'logger'):
-                                self.logger.debug(f"[CONFIG] Using fallback webhook URL from snapshots.config")
-                        else:
-                            if hasattr(self, 'logger'):
-                                self.logger.error(f"[CONFIG] Webhook enabled in JSON for '{server_data.get('name', 'unknown')}' but no URL found in JSON or fallback config. Webhook notifications will be skipped.")
-                            webhook_enabled = False  # Disable if no URL available
-                elif webhook_enabled_json is False:
-                    # Explicitly disabled in JSON, don't use global fallback
-                    webhook_enabled = False
-                else:
-                    # Not configured in JSON, use global enabled flag
-                    webhook_enabled = WEBHOOK_ENABLED
-                    if webhook_enabled:
-                        # Use global URL if per-server URL is not available
-                        if not webhook_url and WEBHOOK_URL:
-                            webhook_url = WEBHOOK_URL
-                        if hasattr(self, 'logger') and webhook_url:
-                            self.logger.debug(f"[CONFIG] Using global webhook settings for '{server_data.get('name', 'unknown')}'")
-                
-                # Validate and convert data types
-                try:
-                    server_config = ServerConfig(
-                        provider=provider,
-                        id=str(server_data['id']),
-                        name=str(server_data['name']),
-                        api_token=str(server_data['api_token']),
-                        retain_last_snapshots=int(server_data['retain_last_snapshots']),
-                        telegram_enabled=bool(telegram_enabled) if telegram_enabled else False,
-                        telegram_bot_token=telegram_bot_token if telegram_bot_token else None,
-                        telegram_chat_id=telegram_chat_id if telegram_chat_id else None,
-                        telegram_message_success=str(telegram_message_success) if telegram_message_success else None,
-                        telegram_message_failure=str(telegram_message_failure) if telegram_message_failure else None,
-                        webhook_enabled=bool(webhook_enabled) if webhook_enabled else False,
-                        webhook_url=webhook_url if webhook_url else None,
-                        webhook_payload_success=webhook_payload_success if isinstance(webhook_payload_success, dict) else None,
-                        webhook_payload_failure=webhook_payload_failure if isinstance(webhook_payload_failure, dict) else None
-                    )
-                    servers.append(server_config)
-                    if hasattr(self, 'logger'):
-                        masked_token = server_config.api_token[:6] + '...' + server_config.api_token[-6:] if len(server_config.api_token) > 12 else '***'
-                        self.logger.debug(f"Loaded config: {server_config.name} (Provider: {provider}, ID: {server_config.id}, Retain: {server_config.retain_last_snapshots}, API Token: {masked_token})")
-                except ValueError as ve:
-                    if hasattr(self, 'logger'):
-                        self.logger.error(f"Invalid data type in '{full_path}': {ve}. Skipping.")
-                    else:
-                        print(f"ERROR: Invalid data type in '{full_path}': {ve}. Skipping.", file=sys.stderr)
-                    continue
-                    
-            except json.JSONDecodeError as e:
-                if hasattr(self, 'logger'):
-                    self.logger.error(f"Error parsing JSON file '{full_path}': {e}. Skipping.")
-                else:
-                    print(f"ERROR: Error parsing JSON file '{full_path}': {e}. Skipping.", file=sys.stderr)
-                continue
-            except Exception as e:
-                # Sanitize error message to avoid leaking config file contents
-                error_msg = str(e)
-                # Remove any potential token-like strings from error messages
-                error_msg = sanitize_log_output(error_msg)
-                if hasattr(self, 'logger'):
-                    self.logger.error(f"Unexpected error processing '{full_path}': {error_msg}. Skipping.")
-                else:
-                    print(f"ERROR: Unexpected error processing '{full_path}': {error_msg}. Skipping.", file=sys.stderr)
-                continue
-        
-        return servers
-
-
-    def setup_logging(self):
-        self.logger = logging.getLogger('snapshots.py')
-        self.logger.setLevel(LOG_LEVEL)
-        handler = RotatingFileHandler(LOG_FILE, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT)
-        
-        # Improved formatter with better structure and alignment
-        formatter = logging.Formatter(
-            fmt='%(asctime)s | %(levelname)-8s | %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S'
-        )
-        handler.setFormatter(formatter)
-        self.logger.addHandler(handler)
-
-        if self.verbose:
-            console_handler = logging.StreamHandler(sys.stdout)
-            console_handler.setFormatter(formatter)
-            self.logger.addHandler(console_handler)
-
-    def error_exit(self, message: str, exit_code: int = 1):
-        """Log error and exit with specified exit code."""
-        if hasattr(self, 'logger'):
-            self.logger.error(message)
-        else:
-            print(f"ERROR: {message}", file=sys.stderr)
-        sys.exit(exit_code)
-
-
-    @staticmethod
-    def is_managed_snapshot(server: ServerConfig, snapshot_name: str) -> bool:
-        """
-        Check if a snapshot was created by this script for the given server.
-        Only snapshots named '<server.name>-<YYYYmmddHHMMSS>' are managed, so manually
-        created snapshots are never touched by the retention policy.
-        """
-        return re.fullmatch(re.escape(server.name) + r"-\d{14}", snapshot_name or "") is not None
-
-    def get_snapshots(self, server: ServerConfig) -> List[dict]:
-        """Get snapshots for a server, routing to provider-specific method."""
-        self.logger.info(f"Retrieving snapshots for {server.provider} server '{server.name}' (ID: {server.id})")
-        if server.provider == "digitalocean":
-            return self.get_digitalocean_snapshots(server)
-        elif server.provider == "hetzner":
-            return self.get_hetzner_snapshots(server)
-        else:
-            self.logger.error(f"Unknown provider: {server.provider}")
-            return []
-    
-    def get_digitalocean_snapshots(self, server: ServerConfig) -> List[dict]:
-        """Get snapshots for a DigitalOcean droplet using direct API call."""
-        self.logger.debug(f"Listing DigitalOcean snapshots for droplet ID: {server.id}")
-        snapshots = []
-        
-        # DigitalOcean API v2: GET /snapshots?resource_type=droplet
-        base_url = "https://api.digitalocean.com/v2"
-        headers = {
-            "Authorization": f"Bearer {server.api_token}",
-            "Content-Type": "application/json"
-        }
-        
-        page = 1
-        per_page = 200
-        
-        while True:
-            try:
-                url = f"{base_url}/snapshots"
-                params = {
-                    "resource_type": "droplet",
-                    "per_page": per_page,
-                    "page": page
-                }
-                
-                self.logger.debug(f"[DIGITALOCEAN] Fetching snapshots page {page}")
-                response = requests.get(url, headers=headers, params=params, timeout=30)
-                response.raise_for_status()
-                
-                data = response.json()
-                snapshot_list = data.get("snapshots", [])
-                
-                if not snapshot_list:
-                    break
-                
-                for snapshot in snapshot_list:
-                    # Only snapshots of this droplet that were created by this script
-                    resource_id = snapshot.get("resource_id")
-                    snapshot_name = snapshot.get("name", "")
-
-                    if str(resource_id) == str(server.id) and self.is_managed_snapshot(server, snapshot_name):
-                        snapshot_id = snapshot.get("id")
-                        created_at_str = snapshot.get("created_at", "")
-                        
-                        try:
-                            # DigitalOcean uses ISO format: "2024-12-02T13:32:34Z"
-                            created_at = datetime.datetime.fromisoformat(created_at_str.replace('Z', '+00:00')).astimezone(datetime.timezone.utc)
-                            snapshots.append({
-                                "id": str(snapshot_id),
-                                "name": snapshot_name,
-                                "created_at": created_at
-                            })
-                            self.logger.debug(f"  Found snapshot: {snapshot_name} (ID: {snapshot_id}, Created: {created_at.strftime('%Y-%m-%d %H:%M:%S')})")
-                        except (ValueError, KeyError) as e:
-                            self.logger.error(f"  Invalid date format for snapshot '{snapshot_name}': {created_at_str}")
-                
-                # Check if there are more pages
-                links = data.get("links", {})
-                if "pages" in links and "next" in links["pages"]:
-                    page += 1
-                else:
-                    break
-                    
-            except requests.exceptions.RequestException as e:
-                error_msg = sanitize_log_output(str(e), server.api_token)
-                self.logger.error(f"[DIGITALOCEAN] Failed to fetch snapshots: {error_msg}")
-                break
-            except Exception as e:
-                error_msg = sanitize_log_output(str(e), server.api_token)
-                self.logger.error(f"[DIGITALOCEAN] Unexpected error fetching snapshots: {error_msg}")
-                break
-
-        self.logger.info(f"Found {len(snapshots)} snapshot(s) for droplet '{server.name}'")
-        return snapshots
-    
-    def get_hetzner_snapshots(self, server: ServerConfig) -> List[dict]:
-        """Get snapshots for a Hetzner Cloud server using direct API call."""
-        self.logger.debug(f"Listing Hetzner Cloud snapshots for server ID: {server.id}")
-        snapshots = []
-        
-        # Hetzner Cloud API v1: GET /images?type=snapshot
-        base_url = "https://api.hetzner.cloud/v1"
-        headers = {
-            "Authorization": f"Bearer {server.api_token}",
-            "Content-Type": "application/json"
-        }
-        
-        page = 1
-        per_page = 50
-        
-        while True:
-            try:
-                url = f"{base_url}/images"
-                params = {
-                    "type": "snapshot",
-                    "per_page": per_page,
-                    "page": page
-                }
-                
-                self.logger.debug(f"[HETZNER] Fetching snapshots page {page}")
-                response = requests.get(url, headers=headers, params=params, timeout=30)
-                response.raise_for_status()
-                
-                data = response.json()
-                images = data.get("images", [])
-                
-                if not images:
-                    break
-                
-                for image in images:
-                    # Hetzner images have a 'description' field that contains the snapshot name
-                    # and 'created' field for timestamp
-                    description = image.get("description", "")
-                    # Only snapshots created from this server by this script
-                    created_from = image.get("created_from") or {}
-                    if str(created_from.get("id")) == str(server.id) and self.is_managed_snapshot(server, description):
-                        snapshot_id = str(image.get("id", ""))
-                        snapshot_name = description
-                        created_at_str = image.get("created", "")
-                        
-                        try:
-                            # Hetzner uses ISO format: "2024-12-02T13:32:34Z"
-                            created_at = datetime.datetime.fromisoformat(created_at_str.replace('Z', '+00:00')).astimezone(datetime.timezone.utc)
-                            snapshots.append({
-                                "id": snapshot_id,
-                                "name": snapshot_name,
-                                "created_at": created_at
-                            })
-                            self.logger.debug(f"  Found snapshot: {snapshot_name} (ID: {snapshot_id}, Created: {created_at.strftime('%Y-%m-%d %H:%M:%S')})")
-                        except (ValueError, KeyError) as e:
-                            self.logger.error(f"  Invalid date format for snapshot '{snapshot_name}': {created_at_str}")
-                
-                # Check if there are more pages
-                meta = data.get("meta", {})
-                pagination = meta.get("pagination", {})
-                if pagination.get("next_page"):
-                    page += 1
-                else:
-                    break
-                    
-            except requests.exceptions.RequestException as e:
-                error_msg = sanitize_log_output(str(e), server.api_token)
-                self.logger.error(f"[HETZNER] Failed to fetch snapshots: {error_msg}")
-                break
-            except Exception as e:
-                error_msg = sanitize_log_output(str(e), server.api_token)
-                self.logger.error(f"[HETZNER] Unexpected error fetching snapshots: {error_msg}")
-                break
-
-        self.logger.info(f"Found {len(snapshots)} snapshot(s) for server '{server.name}'")
-        return snapshots
-
-    def identify_snapshots_to_delete(self, server: ServerConfig, snapshots: List[dict], retain: int) -> List[dict]:
-        snapshots.sort(key=lambda x: x['created_at'], reverse=True)
-        to_delete = snapshots[retain:]
-        if to_delete:
-            self.logger.info(f"Identified {len(to_delete)} snapshot(s) for deletion:")
-            for snap in to_delete:
-                self.logger.info(f"  - {snap['name']} (ID: {snap['id']})")
-        return to_delete
-
-    def create_snapshot(self, server: ServerConfig) -> Optional[str]:
-        """Create a snapshot for a server, routing to provider-specific method."""
-        if server.provider == "digitalocean":
-            return self.create_digitalocean_snapshot(server)
-        elif server.provider == "hetzner":
-            return self.create_hetzner_snapshot(server)
-        else:
-            self.logger.error(f"Unknown provider: {server.provider}")
-            return None
-    
-    def create_digitalocean_snapshot(self, server: ServerConfig) -> Optional[str]:
-        """Create a snapshot for a DigitalOcean droplet using direct API call."""
-        timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-        snapshot_name = f"{server.name}-{timestamp}"
-        self.logger.info(f"Creating new snapshot: {snapshot_name} for droplet ID: {server.id}")
-        self.logger.debug(f"Snapshot creation started at: {datetime.datetime.now().isoformat()}")
-        
-        # DigitalOcean API v2: POST /droplets/{id}/actions
-        base_url = "https://api.digitalocean.com/v2"
-        url = f"{base_url}/droplets/{server.id}/actions"
-        headers = {
-            "Authorization": f"Bearer {server.api_token}",
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "type": "snapshot",
-            "name": snapshot_name
-        }
-        
+    def process_server(self, server: ServerConfig, dry_run: bool = False) -> ServerResult:
+        provider = self.provider_factory(server)
         try:
-            self.logger.debug(f"[DIGITALOCEAN] Sending snapshot creation request")
-            response = requests.post(url, headers=headers, json=payload, timeout=60)
-            response.raise_for_status()
-            
-            data = response.json()
-            action = data.get("action", {})
-            action_id = action.get("id")
-            
-            if action_id:
-                self.logger.debug(f"[DIGITALOCEAN] Snapshot action created (ID: {action_id}), waiting for completion")
-                # Poll for action completion
-                action_status = self._wait_for_digitalocean_action(server.api_token, action_id, timeout=SNAPSHOT_CREATION_TIMEOUT)
-                
-                if action_status == "completed":
-                    self.logger.info(f"  ✓ Snapshot created successfully: {snapshot_name}")
-                    self.logger.debug(f"Snapshot creation completed at: {datetime.datetime.now().isoformat()}")
-                    return snapshot_name
-                elif action_status == "timeout":
-                    self.logger.error(f"  ✗ Snapshot not confirmed within {SNAPSHOT_CREATION_TIMEOUT}s: {snapshot_name} may still complete. Old snapshots are kept.")
-                    return None
-                else:
-                    self.logger.error(f"  ✗ Snapshot creation failed with status: {action_status}")
-                    return None
-            else:
-                self.logger.error(f"  ✗ Failed to create snapshot: No action ID returned")
-                return None
-                
-        except requests.exceptions.RequestException as e:
-            error_msg = sanitize_log_output(str(e), server.api_token)
-            self.logger.error(f"  ✗ Failed to create snapshot: {error_msg}")
-            return None
-        except Exception as e:
-            error_msg = sanitize_log_output(str(e), server.api_token)
-            self.logger.error(f"  ✗ Unexpected error creating snapshot: {error_msg}")
-            return None
-    
-    def _wait_for_digitalocean_action(self, api_token: str, action_id: int, timeout: int = 300) -> str:
-        """Wait for a DigitalOcean action to complete."""
-        base_url = "https://api.digitalocean.com/v2"
-        url = f"{base_url}/actions/{action_id}"
-        headers = {
-            "Authorization": f"Bearer {api_token}",
-            "Content-Type": "application/json"
-        }
-        
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            try:
-                response = requests.get(url, headers=headers, timeout=30)
-                response.raise_for_status()
-                
-                data = response.json()
-                action = data.get("action", {})
-                status = action.get("status", "unknown")
-                
-                if status == "completed":
-                    return "completed"
-                elif status == "errored":
-                    return "errored"
-                elif status == "in-progress":
-                    time.sleep(5)  # Wait 5 seconds before checking again
-                    continue
-                else:
-                    time.sleep(5)
-                    continue
-                    
-            except requests.exceptions.RequestException:
-                time.sleep(5)
-                continue
-        
-        return "timeout"
-    
-    def create_hetzner_snapshot(self, server: ServerConfig) -> Optional[str]:
-        """Create a snapshot for a Hetzner Cloud server using direct API call."""
-        timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-        snapshot_name = f"{server.name}-{timestamp}"
-        self.logger.info(f"Creating new snapshot: {snapshot_name} for server ID: {server.id}")
-        self.logger.debug(f"Snapshot creation started at: {datetime.datetime.now().isoformat()}")
-        
-        # Hetzner Cloud API v1: POST /servers/{id}/actions/create_image
-        base_url = "https://api.hetzner.cloud/v1"
-        url = f"{base_url}/servers/{server.id}/actions/create_image"
-        headers = {
-            "Authorization": f"Bearer {server.api_token}",
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "type": "snapshot",
-            "description": snapshot_name
-        }
-        
+            existing: Optional[List[Snapshot]] = provider.list_snapshots()
+            logger.info(f"Found {len(existing)} managed snapshot(s)")
+        except ProviderError as e:
+            logger.error(f"Listing snapshots failed: {e}")
+            existing = None
+
+        if dry_run:
+            for snapshot in select_for_deletion(existing or [], server.retain_last_snapshots):
+                logger.info(f"[dry run] would delete {snapshot.name} (ID: {snapshot.id})")
+            logger.info(f"[dry run] would create {snapshot_name_for(server)}")
+            return ServerResult(server, success=existing is not None,
+                                total_snapshots=None if existing is None else len(existing))
+
+        result = ServerResult(server, success=False)
+        name = snapshot_name_for(server)
+        logger.info(f"Creating snapshot {name}")
         try:
-            self.logger.debug(f"[HETZNER] Sending snapshot creation request")
-            response = requests.post(url, headers=headers, json=payload, timeout=60)
-            response.raise_for_status()
-            
-            data = response.json()
-            action = data.get("action", {})
-            image = data.get("image", {})
-            
-            if action.get("id") and image.get("id"):
-                self.logger.debug(f"[HETZNER] Snapshot action created (Action ID: {action.get('id')}, Image ID: {image.get('id')})")
-                # Hetzner snapshots are usually created synchronously, but we can wait for the action
-                action_status = self._wait_for_hetzner_action(server.api_token, action.get("id"), timeout=SNAPSHOT_CREATION_TIMEOUT)
-                
-                if action_status == "success":
-                    self.logger.info(f"  ✓ Snapshot created successfully: {snapshot_name}")
-                    self.logger.debug(f"Snapshot creation completed at: {datetime.datetime.now().isoformat()}")
-                    return snapshot_name
-                elif action_status == "timeout":
-                    self.logger.error(f"  ✗ Snapshot not confirmed within {SNAPSHOT_CREATION_TIMEOUT}s: {snapshot_name} may still complete. Old snapshots are kept.")
-                    return None
-                else:
-                    self.logger.error(f"  ✗ Snapshot creation failed with status: {action_status}")
-                    return None
-            else:
-                self.logger.error(f"  ✗ Failed to create snapshot: No action/image ID returned")
-                return None
-                
-        except requests.exceptions.RequestException as e:
-            error_msg = sanitize_log_output(str(e), server.api_token)
-            self.logger.error(f"  ✗ Failed to create snapshot: {error_msg}")
-            return None
-        except Exception as e:
-            error_msg = sanitize_log_output(str(e), server.api_token)
-            self.logger.error(f"  ✗ Unexpected error creating snapshot: {error_msg}")
-            return None
-    
-    def _wait_for_hetzner_action(self, api_token: str, action_id: int, timeout: int = 300) -> str:
-        """Wait for a Hetzner Cloud action to complete."""
-        base_url = "https://api.hetzner.cloud/v1"
-        url = f"{base_url}/actions/{action_id}"
-        headers = {
-            "Authorization": f"Bearer {api_token}",
-            "Content-Type": "application/json"
-        }
-        
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            try:
-                response = requests.get(url, headers=headers, timeout=30)
-                response.raise_for_status()
-                
-                data = response.json()
-                action = data.get("action", {})
-                status = action.get("status", "unknown")
-                
-                if status == "success":
-                    return "success"
-                elif status == "error":
-                    return "error"
-                elif status == "running":
-                    time.sleep(5)  # Wait 5 seconds before checking again
-                    continue
-                else:
-                    time.sleep(5)
-                    continue
-                    
-            except requests.exceptions.RequestException:
-                time.sleep(5)
-                continue
-        
-        return "timeout"
+            action_id = provider.create_snapshot(name)
+            outcome = provider.wait_for_action(action_id, self.settings.snapshot_creation_timeout,
+                                               self.settings.action_poll_interval)
+        except ProviderError as e:
+            outcome, result.error = "failed", str(e)
 
-    def delete_snapshots(self, server: ServerConfig, snapshots: List[dict]):
-        """Delete snapshots for a server, routing to provider-specific method."""
-        if server.provider == "digitalocean":
-            self.delete_digitalocean_snapshots(server, snapshots)
-        elif server.provider == "hetzner":
-            self.delete_hetzner_snapshots(server, snapshots)
+        if outcome == "done":
+            result.success, result.snapshot_name = True, name
+            logger.info(f"Snapshot {name} created")
+        elif outcome == "timeout":
+            result.error = f"not confirmed within {self.settings.snapshot_creation_timeout:.0f}s, it may still complete"
+        elif not result.error:
+            result.error = f"{provider.label} reported the snapshot action as failed"
+
+        # Old snapshots are only deleted once the new one is confirmed, otherwise we could end up without any backup
+        if not result.success:
+            logger.error(f"Snapshot {name} failed: {result.error}. Keeping all existing snapshots.")
+        elif existing is None:
+            logger.warning("Skipping retention because existing snapshots could not be listed")
         else:
-            self.logger.error(f"Unknown provider: {server.provider}")
-    
-    def delete_digitalocean_snapshots(self, server: ServerConfig, snapshots: List[dict]):
-        """Delete snapshots for a DigitalOcean droplet using direct API call."""
-        if not snapshots:
-            return
-        self.logger.info(f"Deleting {len(snapshots)} snapshot(s) for droplet '{server.name}':")
-        
-        # DigitalOcean API v2: DELETE /snapshots/{id}
-        base_url = "https://api.digitalocean.com/v2"
-        headers = {
-            "Authorization": f"Bearer {server.api_token}",
-            "Content-Type": "application/json"
-        }
-        
-        for idx, snap in enumerate(snapshots, 1):
-            self.logger.info(f"  [{idx}/{len(snapshots)}] Deleting: {snap['name']} (ID: {snap['id']})")
-            self.logger.debug(f"  Initiating deletion of snapshot ID: {snap['id']}")
-            
-            url = f"{base_url}/snapshots/{snap['id']}"
-            
-            try:
-                response = requests.delete(url, headers=headers, timeout=30)
-                
-                if response.status_code == 204:
-                    self.logger.info(f"    ✓ Deleted successfully")
-                    self.logger.debug(f"    Deletion confirmed for snapshot ID: {snap['id']}")
-                elif response.status_code == 404:
-                    self.logger.warning(f"    Snapshot not found (likely already deleted)")
-                else:
-                    error_msg = sanitize_log_output(response.text[:200], server.api_token)
-                    self.logger.error(f"    ✗ Failed to delete snapshot (status {response.status_code}): {error_msg}")
-                    
-            except requests.exceptions.RequestException as e:
-                error_msg = sanitize_log_output(str(e), server.api_token)
-                self.logger.error(f"    ✗ Failed to delete snapshot: {error_msg}")
-            except Exception as e:
-                error_msg = sanitize_log_output(str(e), server.api_token)
-                self.logger.error(f"    ✗ Unexpected error deleting snapshot: {error_msg}")
-    
-    def delete_hetzner_snapshots(self, server: ServerConfig, snapshots: List[dict]):
-        """Delete snapshots for a Hetzner Cloud server using direct API call."""
-        if not snapshots:
-            return
-        self.logger.info(f"Deleting {len(snapshots)} snapshot(s) for server '{server.name}':")
-        
-        # Hetzner Cloud API v1: DELETE /images/{id}
-        base_url = "https://api.hetzner.cloud/v1"
-        headers = {
-            "Authorization": f"Bearer {server.api_token}",
-            "Content-Type": "application/json"
-        }
-        
-        for idx, snap in enumerate(snapshots, 1):
-            self.logger.info(f"  [{idx}/{len(snapshots)}] Deleting: {snap['name']} (ID: {snap['id']})")
-            self.logger.debug(f"  Initiating deletion of snapshot ID: {snap['id']}")
-            
-            url = f"{base_url}/images/{snap['id']}"
-            
-            try:
-                response = requests.delete(url, headers=headers, timeout=30)
-                
-                if response.status_code == 204:
-                    self.logger.info(f"    ✓ Deleted successfully")
-                    self.logger.debug(f"    Deletion confirmed for snapshot ID: {snap['id']}")
-                elif response.status_code == 404:
-                    self.logger.warning(f"    Snapshot not found (likely already deleted)")
-                else:
-                    error_msg = sanitize_log_output(response.text[:200], server.api_token)
-                    self.logger.error(f"    ✗ Failed to delete snapshot (status {response.status_code}): {error_msg}")
-                    
-            except requests.exceptions.RequestException as e:
-                error_msg = sanitize_log_output(str(e), server.api_token)
-                self.logger.error(f"    ✗ Failed to delete snapshot: {error_msg}")
-            except Exception as e:
-                error_msg = sanitize_log_output(str(e), server.api_token)
-                self.logger.error(f"    ✗ Unexpected error deleting snapshot: {error_msg}")
+            for snapshot in select_for_deletion(existing, server.retain_last_snapshots):
+                result.deleted += provider.delete_snapshot(snapshot)
 
-    def replace_template_variables(self, template: str, server: ServerConfig, snapshot_name: str, 
-                                   total_snapshots: int, status: str, hostname: str, timestamp: str) -> str:
-        """Replace template variables in custom messages."""
-        replacements = {
-            '{script}': 'snapshots.py',
-            '{provider}': server.provider,
-            '{server_name}': server.name,
-            '{server_id}': server.id,
-            '{droplet_name}': server.name,  # Backward compatibility
-            '{droplet_id}': server.id,  # Backward compatibility
-            '{snapshot_name}': snapshot_name,
-            '{total_snapshots}': str(total_snapshots),
-            '{snapshot_info}': f'{total_snapshots} snapshots exist',
-            '{status}': status.upper(),
-            '{hostname}': hostname,
-            '{timestamp}': timestamp
-        }
-        result = template
-        for placeholder, value in replacements.items():
-            result = result.replace(placeholder, value)
-        return result
-    
-    def replace_template_variables_dict(self, template_dict: dict, server: ServerConfig, snapshot_name: str,
-                                       total_snapshots: int, status: str, hostname: str, timestamp: str) -> dict:
-        """Replace template variables in dictionary (for webhook payloads)."""
-        result = {}
-        replacements = {
-            '{script}': 'snapshots.py',
-            '{provider}': server.provider,
-            '{server_name}': server.name,
-            '{server_id}': server.id,
-            '{droplet_name}': server.name,  # Backward compatibility
-            '{droplet_id}': server.id,  # Backward compatibility
-            '{snapshot_name}': snapshot_name,
-            '{total_snapshots}': str(total_snapshots),
-            '{snapshot_info}': f'{total_snapshots} snapshots exist',
-            '{status}': status.upper(),
-            '{hostname}': hostname,
-            '{timestamp}': timestamp
-        }
-        for key, value in template_dict.items():
-            if isinstance(value, str):
-                for placeholder, replacement in replacements.items():
-                    value = value.replace(placeholder, replacement)
-                result[key] = value
-            elif isinstance(value, dict):
-                result[key] = self.replace_template_variables_dict(value, server, snapshot_name, 
-                                                                   total_snapshots, status, hostname, timestamp)
-            elif isinstance(value, list):
-                result[key] = [
-                    self.replace_template_variables_dict(item, server, snapshot_name, total_snapshots, 
-                                                        status, hostname, timestamp) if isinstance(item, dict)
-                    else self.replace_template_variables(str(item), server, snapshot_name, total_snapshots,
-                                                        status, hostname, timestamp) if isinstance(item, str)
-                    else item
-                    for item in value
-                ]
-            else:
-                result[key] = value
+        try:
+            result.total_snapshots = len(provider.list_snapshots())
+        except ProviderError as e:
+            logger.warning(f"Could not count snapshots: {e}")
         return result
 
-    def write_final_status(self, server: ServerConfig, snapshot_name: str, total_snapshots: int, status: str):
-        hostname = os.uname().nodename
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        final_status_message = f"FINAL_STATUS | snapshots.py | {server.provider} | {server.name} | {status.upper()} | {hostname} | {timestamp} | {snapshot_name} | {total_snapshots} snapshots exist"
-        self.logger.info(final_status_message)
-        
-        # Create standardized notification data structure (used by both Telegram and webhook)
-        notification_data = create_notification_data(
-            script_name="snapshots.py",
-            server_name=server.name,
-            server_id=server.id,
-            status=status.upper(),
-            hostname=hostname,
-            timestamp=timestamp,
-            snapshot_name=snapshot_name,
-            total_snapshots=total_snapshots,
-            provider=server.provider
-        )
-        
-        # Send Telegram notification if enabled for this server
-        self.logger.debug(f"[NOTIFICATIONS] Checking Telegram notification configuration")
-        # Only send if explicitly enabled (either per-server or global fallback)
-        # Don't send if global enabled is False, even if credentials exist
-        if server.telegram_enabled:
-            if server.telegram_bot_token and server.telegram_chat_id:
-                self.logger.debug(f"[NOTIFICATIONS] Using Telegram credentials for server '{server.name}'")
-                # Use custom message if provided (per-server or fallback), otherwise use default format from data
-                custom_message = None
-                if status.upper() == "SUCCESS":
-                    if server.telegram_message_success:
-                        custom_message = self.replace_template_variables(
-                            server.telegram_message_success, server, snapshot_name, 
-                            total_snapshots, status, hostname, timestamp
-                        )
-                        self.logger.debug(f"[NOTIFICATIONS] Using per-server custom success message template")
-                    elif TELEGRAM_MESSAGE_SUCCESS:
-                        custom_message = self.replace_template_variables(
-                            TELEGRAM_MESSAGE_SUCCESS, server, snapshot_name, 
-                            total_snapshots, status, hostname, timestamp
-                        )
-                        self.logger.debug(f"[NOTIFICATIONS] Using fallback success message template from config")
-                elif status.upper() == "FAILURE":
-                    if server.telegram_message_failure:
-                        custom_message = self.replace_template_variables(
-                            server.telegram_message_failure, server, snapshot_name,
-                            total_snapshots, status, hostname, timestamp
-                        )
-                        self.logger.debug(f"[NOTIFICATIONS] Using per-server custom failure message template")
-                    elif TELEGRAM_MESSAGE_FAILURE:
-                        custom_message = self.replace_template_variables(
-                            TELEGRAM_MESSAGE_FAILURE, server, snapshot_name,
-                            total_snapshots, status, hostname, timestamp
-                        )
-                        self.logger.debug(f"[NOTIFICATIONS] Using fallback failure message template from config")
-                
-                send_telegram_notification(
-                    notification_data, 
-                    self.logger,
-                    bot_token=server.telegram_bot_token,
-                    chat_id=server.telegram_chat_id,
-                    custom_message=custom_message
-                )
-            else:
-                # Telegram enabled but credentials missing - should have been handled in load_configs
-                # but check fallback one more time just in case
-                if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-                    self.logger.debug(f"[NOTIFICATIONS] Using global Telegram credentials (fallback) for server '{server.name}'")
-                    # Use custom message if provided (per-server or fallback), otherwise use default format from data
-                    custom_message = None
-                    if status.upper() == "SUCCESS":
-                        if server.telegram_message_success:
-                            custom_message = self.replace_template_variables(
-                                server.telegram_message_success, server, snapshot_name, 
-                                total_snapshots, status, hostname, timestamp
-                            )
-                            self.logger.debug(f"[NOTIFICATIONS] Using per-server custom success message template (fallback credentials)")
-                        elif TELEGRAM_MESSAGE_SUCCESS:
-                            custom_message = self.replace_template_variables(
-                                TELEGRAM_MESSAGE_SUCCESS, server, snapshot_name, 
-                                total_snapshots, status, hostname, timestamp
-                            )
-                            self.logger.debug(f"[NOTIFICATIONS] Using fallback success message template from config")
-                    elif status.upper() == "FAILURE":
-                        if server.telegram_message_failure:
-                            custom_message = self.replace_template_variables(
-                                server.telegram_message_failure, server, snapshot_name,
-                                total_snapshots, status, hostname, timestamp
-                            )
-                            self.logger.debug(f"[NOTIFICATIONS] Using per-server custom failure message template (fallback credentials)")
-                        elif TELEGRAM_MESSAGE_FAILURE:
-                            custom_message = self.replace_template_variables(
-                                TELEGRAM_MESSAGE_FAILURE, server, snapshot_name,
-                                total_snapshots, status, hostname, timestamp
-                            )
-                            self.logger.debug(f"[NOTIFICATIONS] Using fallback failure message template from config")
-                    
-                    send_telegram_notification(notification_data, self.logger, custom_message=custom_message)
-                else:
-                    self.logger.debug(f"[NOTIFICATIONS] Telegram notifications skipped - no credentials available for server '{server.name}'")
-        else:
-            self.logger.debug(f"[NOTIFICATIONS] Telegram notifications skipped (not enabled for server '{server.name}')")
-        
-        # Send webhook notification if enabled for this server
-        # Only send if explicitly enabled (either per-server or global fallback)
-        # Don't send if global enabled is False, even if URL exists
-        webhook_url_to_use = None
-        if server.webhook_enabled:
-            if server.webhook_url:
-                self.logger.debug(f"[NOTIFICATIONS] Using webhook URL for server '{server.name}'")
-                webhook_url_to_use = server.webhook_url
-            else:
-                # Webhook enabled but URL missing - should have been handled in load_configs
-                # but check fallback one more time just in case
-                if WEBHOOK_URL:
-                    self.logger.debug(f"[NOTIFICATIONS] Using global webhook URL (fallback) for server '{server.name}'")
-                    webhook_url_to_use = WEBHOOK_URL
-                else:
-                    self.logger.debug(f"[NOTIFICATIONS] Webhook notifications skipped - no URL available for server '{server.name}'")
-        else:
-            self.logger.debug(f"[NOTIFICATIONS] Webhook notifications skipped (not enabled for server '{server.name}')")
-        
-        if webhook_url_to_use:
-            self.logger.debug(f"[NOTIFICATIONS] Preparing webhook notification")
-            # Use custom payload if provided (per-server or fallback), otherwise use standardized data structure
-            payload = None
-            if status.upper() == "SUCCESS":
-                if server.webhook_payload_success:
-                    payload = self.replace_template_variables_dict(
-                        server.webhook_payload_success.copy(), server, snapshot_name,
-                        total_snapshots, status, hostname, timestamp
-                    )
-                    self.logger.debug(f"[NOTIFICATIONS] Using per-server custom success payload template")
-                elif WEBHOOK_PAYLOAD_SUCCESS:
-                    try:
-                        fallback_payload = json.loads(WEBHOOK_PAYLOAD_SUCCESS)
-                        payload = self.replace_template_variables_dict(
-                            fallback_payload, server, snapshot_name,
-                            total_snapshots, status, hostname, timestamp
-                        )
-                        self.logger.debug(f"[NOTIFICATIONS] Using fallback success payload template from config")
-                    except json.JSONDecodeError as e:
-                        self.logger.warning(f"[NOTIFICATIONS] Invalid JSON in fallback success payload template: {e}. Using default.")
-            elif status.upper() == "FAILURE":
-                if server.webhook_payload_failure:
-                    payload = self.replace_template_variables_dict(
-                        server.webhook_payload_failure.copy(), server, snapshot_name,
-                        total_snapshots, status, hostname, timestamp
-                    )
-                    self.logger.debug(f"[NOTIFICATIONS] Using per-server custom failure payload template")
-                elif WEBHOOK_PAYLOAD_FAILURE:
-                    try:
-                        fallback_payload = json.loads(WEBHOOK_PAYLOAD_FAILURE)
-                        payload = self.replace_template_variables_dict(
-                            fallback_payload, server, snapshot_name,
-                            total_snapshots, status, hostname, timestamp
-                        )
-                        self.logger.debug(f"[NOTIFICATIONS] Using fallback failure payload template from config")
-                    except json.JSONDecodeError as e:
-                        self.logger.warning(f"[NOTIFICATIONS] Invalid JSON in fallback failure payload template: {e}. Using default.")
-            
-            # If no custom payload was used, use the standardized data structure
-            if payload is None:
-                # Use the same standardized data structure as Telegram
-                # Ensure all values are JSON-serializable for n8n compatibility
-                payload = notification_data.copy()
-                # Convert total_snapshots to int if it's not already (for consistency)
-                if isinstance(payload.get('total_snapshots'), str):
-                    try:
-                        payload['total_snapshots'] = int(payload['total_snapshots'])
-                    except (ValueError, TypeError):
-                        pass  # Keep as string if conversion fails
-            
-            # Ensure payload is JSON-serializable (n8n requirement)
+    def run(self, dry_run: bool = False) -> List[ServerResult]:
+        """Process all servers one after another. A failing server never stops the others."""
+        results = []
+        for idx, server in enumerate(self.servers, 1):
+            logger.info(f"[{idx}/{len(self.servers)}] {server.provider} '{server.name}' "
+                        f"(ID: {server.id}, retain: {server.retain_last_snapshots})")
             try:
-                json.dumps(payload)
-            except (TypeError, ValueError) as e:
-                self.logger.error(f"[NOTIFICATIONS] Payload is not JSON-serializable: {e}")
-                payload = {str(k): str(v) for k, v in payload.items()}  # Fallback: convert all to strings
-            
-            send_webhook_notification(
-                self.logger,
-                webhook_url=webhook_url_to_use,
-                payload=payload,
-                timeout=WEBHOOK_TIMEOUT,
-                retries=WEBHOOK_RETRIES,
-                base_delay=WEBHOOK_BASE_DELAY_BETWEEN_RETRIES
-            )
-
-    def manage_snapshots_for_server(self, server: ServerConfig):
-        provider_label = server.provider.upper()
-        self.logger.info("=" * 80)
-        self.logger.info(f"Managing {provider_label} server: {server.name} (ID: {server.id})")
-        self.logger.info(f"  Configuration: Retain last {server.retain_last_snapshots} snapshot(s)")
-        self.logger.info(f"  Snapshot naming: {server.name}-<timestamp>")
-        masked_token = server.api_token[:6] + '...' + server.api_token[-6:] if len(server.api_token) > 12 else '***'
-        self.logger.debug(f"  API token configured: Yes (masked: {masked_token})")
-        
-        # Log notification settings
-        # Note: server.telegram_enabled and server.webhook_enabled already reflect
-        # the correct state (per-server enabled OR global enabled when not configured)
-        # If global enabled=false, these will be False even if credentials/URL exist
-        notifications = []
-        if server.telegram_enabled and server.telegram_bot_token and server.telegram_chat_id:
-            notifications.append("Telegram")
-        
-        webhook_url_to_use = None
-        if server.webhook_enabled and server.webhook_url:
-            notifications.append("Webhook")
-            webhook_url_to_use = server.webhook_url
-        
-        if notifications:
-            self.logger.info(f"  Notifications: {', '.join(notifications)}")
-        else:
-            self.logger.info(f"  Notifications: None")
-        
-        self.logger.info("-" * 80)
-
-        # Retrieve existing snapshots
-        self.logger.debug(f"Step 1/5: Retrieving existing snapshots for server '{server.name}'")
-        snapshots = self.get_snapshots(server)
-        self.logger.debug(f"Step 1/5: Completed - Found {len(snapshots)} existing snapshot(s)")
-
-        # Identify snapshots to delete based on retention policy
-        self.logger.debug(f"Step 2/5: Identifying snapshots to delete (retain: {server.retain_last_snapshots})")
-        to_delete = self.identify_snapshots_to_delete(server, snapshots, server.retain_last_snapshots)
-        self.logger.debug(f"Step 2/5: Completed - {len(to_delete)} snapshot(s) marked for deletion")
-
-        # Create a new snapshot
-        self.logger.debug(f"Step 3/5: Creating new snapshot for server '{server.name}'")
-        snapshot_name = self.create_snapshot(server)
-        if snapshot_name:
-            self.logger.debug(f"Step 3/5: Completed - Snapshot '{snapshot_name}' created")
-        else:
-            self.logger.debug(f"Step 3/5: Failed - Snapshot creation unsuccessful")
-
-        # Delete old snapshots - only if the new snapshot is confirmed, otherwise we could end up without any backup
-        self.logger.debug(f"Step 4/5: Deleting old snapshots")
-        if to_delete and not snapshot_name:
-            self.logger.warning(f"New snapshot not confirmed - keeping all {len(to_delete)} snapshot(s) marked for deletion")
-            self.logger.debug(f"Step 4/5: Skipped - Snapshot creation unsuccessful")
-        elif to_delete:
-            self.delete_snapshots(server, to_delete)
-            self.logger.debug(f"Step 4/5: Completed - Deleted {len(to_delete)} snapshot(s)")
-        else:
-            self.logger.info("No snapshots to delete (retention policy satisfied)")
-            self.logger.debug(f"Step 4/5: Skipped - No snapshots to delete")
-
-        # Re-fetch snapshots after creation and deletion to get the updated count
-        self.logger.debug(f"Step 5/5: Re-fetching snapshots to get final count")
-        updated_snapshots = self.get_snapshots(server)
-        total_snapshots = len(updated_snapshots)
-        self.logger.debug(f"Step 5/5: Completed - Final snapshot count: {total_snapshots}")
-
-        # Write final status to the log
-        if snapshot_name:
-            status = "success"
-        else:
-            status = "failure"
-        self.write_final_status(server, snapshot_name if snapshot_name else "none", total_snapshots, status)
-
-        self.logger.info("-" * 80)
-        self.logger.info(f"Completed snapshot management for {provider_label} server: {server.name}")
-        self.logger.info("=" * 80)
-        self.logger.info("")  # Empty line for visual separation
-        return snapshot_name is not None
-
-    def run(self):
-        """Run snapshot management for all servers. Continue processing even if one fails."""
-        self.logger.info("")
-        self.logger.info("=" * 80)
-        self.logger.info("SNAPSHOT MANAGEMENT SESSION STARTED")
-        self.logger.info(f"Timestamp: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        self.logger.info(f"Hostname: {os.uname().nodename}")
-        self.logger.info(f"Total servers configured: {len(self.servers)}")
-        self.logger.info("=" * 80)
-        self.logger.info("")
-        
-        success_count = 0
-        failure_count = 0
-        
-        for idx, server in enumerate(self.servers):
-            self.logger.info(f"Processing server {idx + 1}/{len(self.servers)}")
-            try:
-                if self.manage_snapshots_for_server(server):
-                    success_count += 1
-                else:
-                    failure_count += 1
+                result = self.process_server(server, dry_run=dry_run)
             except Exception as e:
-                failure_count += 1
-                error_msg = sanitize_log_output(str(e), server.api_token if hasattr(server, 'api_token') else None)
-                self.logger.error(f"An unexpected error occurred for {server.provider} server '{server.name}': {error_msg}", exc_info=True)
+                logger.exception(f"Unexpected error for '{server.name}'")
+                result = ServerResult(server, success=False, error=f"unexpected error: {e}")
+            logger.info(f"FINAL_STATUS | {server.provider} | {server.name} | "
+                        f"{'SUCCESS' if result.success else 'FAILURE'} | {result.snapshot_name or 'none'} | "
+                        f"{'unknown' if result.total_snapshots is None else result.total_snapshots} snapshots | "
+                        f"{result.deleted} deleted")
+            if not dry_run:
+                self.notifier.server_finished(result)
+            results.append(result)
+            if idx < len(self.servers):
+                time.sleep(self.settings.delay_between_servers)
+        return results
 
-            if idx < len(self.servers) - 1:
-                self.logger.info(f"Waiting for {DELAY_BETWEEN_SERVERS} seconds before processing the next server...")
-                time.sleep(DELAY_BETWEEN_SERVERS)
-        
-        # Log summary
-        self.logger.info("")
-        self.logger.info("=" * 80)
-        self.logger.info(f"SUMMARY: {success_count} succeeded, {failure_count} failed out of {len(self.servers)} total")
-        self.logger.info("=" * 80)
-        
-        # Print summary to stderr (will appear in cronjob.log)
-        summary_msg = f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] SUMMARY: {success_count} succeeded, {failure_count} failed out of {len(self.servers)} total"
-        print(summary_msg, file=sys.stderr)
-        
-        # Exit with error code if all failed, or if any failed (for cron monitoring)
-        if failure_count > 0:
-            if success_count == 0:
-                self.logger.error("All servers failed")
-                print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ERROR: All servers failed", file=sys.stderr)
-                sys.exit(1)
-            else:
-                self.logger.warning(f"Partial failure: {failure_count} server(s) failed")
-                print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] WARNING: Partial failure: {failure_count} server(s) failed", file=sys.stderr)
-                sys.exit(2)  # Partial failure
 
-def parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Manage snapshots for multiple DigitalOcean droplets and Hetzner Cloud servers.")
-    parser.add_argument(
-        'configs',
-        nargs='*',
-        help=f"JSON configuration files for servers located in the '{CONFIGS_DIR}' directory. Defaults to all .json files in the directory if not specified."
-    )
-    parser.add_argument(
-        '-v', '--verbose',
-        action='store_true',
-        help="Enable verbose logging to the console."
-    )
-    return parser.parse_args()
+def exit_code(results: List[ServerResult]) -> int:
+    """0 = all succeeded, 1 = all failed (or nothing to do), 2 = partial failure."""
+    failed = sum(not r.success for r in results)
+    if not results or failed == len(results):
+        return 1
+    return 2 if failed else 0
 
-def acquire_lock():
-    """Acquire a lock file to prevent concurrent execution."""
+
+def run_summary(results: List[ServerResult], duration: float) -> str:
+    failed = [r.server.name for r in results if not r.success]
+    minutes = f"{duration / 60:.0f}min"
+    if not failed:
+        return f"OK: {len(results)}/{len(results)} snapshots created in {minutes}"
+    return f"FAILED {len(failed)}/{len(results)} in {minutes}: {', '.join(failed)}"
+
+
+# ============================================================================
+# Runtime: logging, lock, entry point
+# ============================================================================
+
+def setup_logging(settings: Settings, verbose: bool = False):
+    """
+    The log file is the main record. To limit SD card writes it is small and rotated, and the
+    console (cron mail, journald) only gets warnings unless --verbose is given or file logging is off.
+    """
+    logger.handlers.clear()
+    logger.propagate = False
+    logger.setLevel(logging.DEBUG if verbose else settings.log_level)
+    if REDACTOR not in logger.filters:
+        logger.addFilter(REDACTOR)
+    formatter = logging.Formatter("%(asctime)s | %(levelname)-8s | %(message)s", "%Y-%m-%d %H:%M:%S")
+
+    if settings.log_to_file:
+        os.makedirs(os.path.dirname(settings.log_file), exist_ok=True)
+        file_handler = RotatingFileHandler(settings.log_file, maxBytes=settings.log_max_bytes,
+                                           backupCount=settings.log_backup_count, encoding="utf-8", delay=True)
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+
+    console = logging.StreamHandler(sys.stderr)
+    console.setFormatter(formatter)
+    console.setLevel(logging.DEBUG if verbose or not settings.log_to_file else logging.WARNING)
+    logger.addHandler(console)
+
+
+def acquire_lock(path: str) -> Optional[int]:
+    """Returns the lock file descriptor, or None if another instance holds the lock."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        # Ensure logs directory exists
-        if not os.path.exists(LOGS_DIR):
-            os.makedirs(LOGS_DIR, exist_ok=True)
-        
-        lock_fd = os.open(LOCK_FILE, os.O_CREAT | os.O_WRONLY | os.O_TRUNC)
-        try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            # Write PID to lock file
-            os.write(lock_fd, str(os.getpid()).encode())
-            print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Lock acquired successfully (PID: {os.getpid()})", file=sys.stderr)
-            return lock_fd
-        except BlockingIOError:
-            os.close(lock_fd)
-            print(f"ERROR: Another instance of snapshots.py is already running. Lock file: {LOCK_FILE}", file=sys.stderr)
-            sys.exit(3)  # Exit code 3 for lock failure
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    os.ftruncate(fd, 0)
+    os.write(fd, str(os.getpid()).encode())
+    return fd
+
+
+def release_lock(fd: int):
+    fcntl.flock(fd, fcntl.LOCK_UN)
+    os.close(fd)
+
+
+def parse_arguments(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Manage snapshots for DigitalOcean droplets and Hetzner Cloud servers.")
+    parser.add_argument("configs", nargs="*",
+                        help="Server JSON files in the configs directory (default: all *.json files)")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Show debug output on the console")
+    parser.add_argument("-n", "--dry-run", action="store_true",
+                        help="Only show which snapshots would be created and deleted. No changes, no notifications.")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    return parser.parse_args(argv)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = parse_arguments(argv)
+    try:
+        settings = load_settings(CONFIG_FILE)
+    except ConfigError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+    setup_logging(settings, args.verbose)
+    for warning in settings.warnings:
+        logger.warning(warning)
+
+    lock_fd = acquire_lock(settings.lock_file)
+    if lock_fd is None:
+        logger.error("Another instance is already running, exiting")
+        return 3
+
+    notifier = Notifier(settings)
+    started = time.monotonic()
+    try:
+        logger.info(f"=== {SCRIPT_NAME} {__version__} started{' (dry run)' if args.dry_run else ''} ===")
+        if not os.path.isdir(settings.configs_dir):
+            raise ConfigError(f"configs directory '{settings.configs_dir}' does not exist")
+        servers = load_servers(settings, args.configs)
+        if not servers:
+            raise ConfigError("no valid server configuration found")
+
+        results = SnapshotManager(settings, servers, notifier).run(dry_run=args.dry_run)
+        code = exit_code(results)
+        summary = run_summary(results, time.monotonic() - started)
+        logger.log(logging.INFO if code == 0 else logging.ERROR, f"=== {summary} ===")
+        if not args.dry_run:
+            notifier.run_finished(code == 0, summary)
+        return code
+    except ConfigError as e:
+        logger.error(f"Configuration error: {e}")
+        if not args.dry_run:
+            notifier.run_finished(False, f"Configuration error: {e}")
+        return 1
     except Exception as e:
-        print(f"ERROR: Failed to acquire lock: {e}", file=sys.stderr)
-        sys.exit(3)
-
-def release_lock(lock_fd):
-    """Release the lock file."""
-    try:
-        fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        os.close(lock_fd)
-        try:
-            os.remove(LOCK_FILE)
-        except OSError:
-            pass  # Ignore errors removing lock file
-    except Exception:
-        pass  # Ignore errors releasing lock
-
-def main():
-    args = parse_arguments()
-    
-    # Print startup message to stderr (will appear in cronjob.log)
-    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Starting snapshot management script...", file=sys.stderr)
-
-    # Ensure directories exist
-    if not os.path.isdir(CONFIGS_DIR):
-        print(f"ERROR: The configuration directory '{CONFIGS_DIR}' does not exist.", file=sys.stderr)
-        sys.exit(1)
-
-    # Acquire lock to prevent concurrent execution
-    lock_fd = None
-    try:
-        lock_fd = acquire_lock()
-        
-        if args.configs:
-            config_files = args.configs
-        else:
-            # Get all .json files in the configs directory, sorted alphabetically
-            # Exclude macOS resource fork files (._*)
-            config_files = sorted(f for f in os.listdir(CONFIGS_DIR) 
-                                 if f.lower().endswith('.json') and not f.startswith('._'))
-            if not config_files:
-                print(f"WARNING: No '.json' configuration files found in the '{CONFIGS_DIR}' directory.", file=sys.stderr)
-                sys.exit(0)  # Exit successfully if no configs (might be intentional)
-
-        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Found {len(config_files)} configuration file(s).", file=sys.stderr)
-        
-        # Initialize the SnapshotManager with the provided configuration files
-        manager = SnapshotManager(config_paths=config_files, verbose=args.verbose)
-        manager.run()
-        
-        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Script completed successfully.", file=sys.stderr)
-    except Exception as e:
-        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ERROR: Script failed with exception: {e}", file=sys.stderr)
-        raise
+        logger.exception("Unexpected error")
+        if not args.dry_run:
+            notifier.run_finished(False, f"Crashed: {type(e).__name__}: {e}")
+        return 1
     finally:
-        # Always release lock
-        if lock_fd is not None:
-            release_lock(lock_fd)
+        release_lock(lock_fd)
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

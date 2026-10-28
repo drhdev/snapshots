@@ -169,6 +169,9 @@ cython_debug/
 !*.config.sample
 !*.json.sample
 
-# Log files and test directory
+# Log files
 logs/
-tests/
+
+# Local-only files (old tests, notes) that must not be published
+.local-archive/
+.claude/
