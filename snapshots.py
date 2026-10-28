@@ -736,6 +736,15 @@ class SnapshotManager:
         sys.exit(exit_code)
 
 
+    @staticmethod
+    def is_managed_snapshot(server: ServerConfig, snapshot_name: str) -> bool:
+        """
+        Check if a snapshot was created by this script for the given server.
+        Only snapshots named '<server.name>-<YYYYmmddHHMMSS>' are managed, so manually
+        created snapshots are never touched by the retention policy.
+        """
+        return re.fullmatch(re.escape(server.name) + r"-\d{14}", snapshot_name or "") is not None
+
     def get_snapshots(self, server: ServerConfig) -> List[dict]:
         """Get snapshots for a server, routing to provider-specific method."""
         self.logger.info(f"Retrieving snapshots for {server.provider} server '{server.name}' (ID: {server.id})")
@@ -782,11 +791,11 @@ class SnapshotManager:
                     break
                 
                 for snapshot in snapshot_list:
-                    # Filter snapshots that match our droplet ID or name
+                    # Only snapshots of this droplet that were created by this script
                     resource_id = snapshot.get("resource_id")
                     snapshot_name = snapshot.get("name", "")
-                    
-                    if str(resource_id) == str(server.id) or server.name in snapshot_name:
+
+                    if str(resource_id) == str(server.id) and self.is_managed_snapshot(server, snapshot_name):
                         snapshot_id = snapshot.get("id")
                         created_at_str = snapshot.get("created_at", "")
                         
@@ -859,8 +868,9 @@ class SnapshotManager:
                     # Hetzner images have a 'description' field that contains the snapshot name
                     # and 'created' field for timestamp
                     description = image.get("description", "")
-                    # Filter snapshots that match our server name pattern or were created from this server
-                    if server.name in description or description.startswith(server.name):
+                    # Only snapshots created from this server by this script
+                    created_from = image.get("created_from") or {}
+                    if str(created_from.get("id")) == str(server.id) and self.is_managed_snapshot(server, description):
                         snapshot_id = str(image.get("id", ""))
                         snapshot_name = description
                         created_at_str = image.get("created", "")
@@ -953,6 +963,9 @@ class SnapshotManager:
                     self.logger.info(f"  ✓ Snapshot created successfully: {snapshot_name}")
                     self.logger.debug(f"Snapshot creation completed at: {datetime.datetime.now().isoformat()}")
                     return snapshot_name
+                elif action_status == "timeout":
+                    self.logger.error(f"  ✗ Snapshot not confirmed within {SNAPSHOT_CREATION_TIMEOUT}s: {snapshot_name} may still complete. Old snapshots are kept.")
+                    return None
                 else:
                     self.logger.error(f"  ✗ Snapshot creation failed with status: {action_status}")
                     return None
@@ -1042,6 +1055,9 @@ class SnapshotManager:
                     self.logger.info(f"  ✓ Snapshot created successfully: {snapshot_name}")
                     self.logger.debug(f"Snapshot creation completed at: {datetime.datetime.now().isoformat()}")
                     return snapshot_name
+                elif action_status == "timeout":
+                    self.logger.error(f"  ✗ Snapshot not confirmed within {SNAPSHOT_CREATION_TIMEOUT}s: {snapshot_name} may still complete. Old snapshots are kept.")
+                    return None
                 else:
                     self.logger.error(f"  ✗ Snapshot creation failed with status: {action_status}")
                     return None
@@ -1475,9 +1491,12 @@ class SnapshotManager:
         else:
             self.logger.debug(f"Step 3/5: Failed - Snapshot creation unsuccessful")
 
-        # Delete old snapshots
+        # Delete old snapshots - only if the new snapshot is confirmed, otherwise we could end up without any backup
         self.logger.debug(f"Step 4/5: Deleting old snapshots")
-        if to_delete:
+        if to_delete and not snapshot_name:
+            self.logger.warning(f"New snapshot not confirmed - keeping all {len(to_delete)} snapshot(s) marked for deletion")
+            self.logger.debug(f"Step 4/5: Skipped - Snapshot creation unsuccessful")
+        elif to_delete:
             self.delete_snapshots(server, to_delete)
             self.logger.debug(f"Step 4/5: Completed - Deleted {len(to_delete)} snapshot(s)")
         else:
@@ -1501,6 +1520,7 @@ class SnapshotManager:
         self.logger.info(f"Completed snapshot management for {provider_label} server: {server.name}")
         self.logger.info("=" * 80)
         self.logger.info("")  # Empty line for visual separation
+        return snapshot_name is not None
 
     def run(self):
         """Run snapshot management for all servers. Continue processing even if one fails."""
@@ -1519,16 +1539,18 @@ class SnapshotManager:
         for idx, server in enumerate(self.servers):
             self.logger.info(f"Processing server {idx + 1}/{len(self.servers)}")
             try:
-                self.manage_snapshots_for_server(server)
-                success_count += 1
-                
-                if idx < len(self.servers) - 1:
-                    self.logger.info(f"Waiting for {DELAY_BETWEEN_SERVERS} seconds before processing the next server...")
-                    time.sleep(DELAY_BETWEEN_SERVERS)
+                if self.manage_snapshots_for_server(server):
+                    success_count += 1
+                else:
+                    failure_count += 1
             except Exception as e:
                 failure_count += 1
                 error_msg = sanitize_log_output(str(e), server.api_token if hasattr(server, 'api_token') else None)
                 self.logger.error(f"An unexpected error occurred for {server.provider} server '{server.name}': {error_msg}", exc_info=True)
+
+            if idx < len(self.servers) - 1:
+                self.logger.info(f"Waiting for {DELAY_BETWEEN_SERVERS} seconds before processing the next server...")
+                time.sleep(DELAY_BETWEEN_SERVERS)
         
         # Log summary
         self.logger.info("")

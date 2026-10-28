@@ -20,7 +20,7 @@
 
 - **Multi-Provider Support**: Manage snapshots for both DigitalOcean Droplets and Hetzner Cloud Servers.
 - **Automated Snapshot Management**: Schedule regular snapshots for your cloud servers.
-- **Retention Policy**: Define how many recent snapshots to retain and automatically delete older ones.
+- **Retention Policy**: Define how many recent snapshots to retain and automatically delete older ones. Old snapshots are only deleted after the new snapshot is confirmed, and only snapshots of the configured server ID named `<name>-<YYYYmmddHHMMSS>` are managed, so manually created snapshots are never deleted.
 - **Telegram Notifications**: Receive real-time updates on snapshot operations via Telegram with customizable message templates.
 - **Webhook Notifications**: Send notifications to custom webhook endpoints (n8n compatible) with customizable JSON payloads.
 - **Flexible Configuration**: Manage multiple servers with individual settings using JSON configuration files.
@@ -686,6 +686,7 @@ Logs are managed with log rotation to prevent uncontrolled growth. The `logs/` d
   - `0`: Success
   - `1`: All servers failed or critical error
   - `2`: Partial failure (some servers succeeded, some failed)
+  - A server counts as failed when its new snapshot was not confirmed (API error or timeout)
   - `3`: Lock file error (another instance is running)
 
 ### API Integration and Documentation
